@@ -1,0 +1,2 @@
+# IANA saat dilimleri; Windows'ta Europe/Istanbul için de gereklidir.
+tzdata==2026.4
