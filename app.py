@@ -34,6 +34,8 @@ class Handler(SimpleHTTPRequestHandler):
         path=urlparse(self.path).path
         if path=='/api/state':
             self.respond(self.service.state())
+        elif path=='/api/symbols':
+            self.respond(self.service.symbols())
         elif path=='/api/health':
             state=self.service.state()
             self.respond(dict(ok=True,mode='paper',market_ready=state['status']['fresh'],
@@ -63,7 +65,7 @@ class Handler(SimpleHTTPRequestHandler):
             if method=='PATCH' and path=='/api/config':
                 result=self.service.configure(payload)
             elif method=='POST' and path=='/api/control':
-                result=self.service.control(payload.get('action'))
+                result=self.service.control(payload.get('action'),payload.get('symbol'),payload.get('amount'))
             elif method=='POST' and path=='/api/backtest':
                 result=self.service.test_history(payload)
             else:

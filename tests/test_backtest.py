@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from bot.backtest import compare_strategies, run_backtest
 from bot.core import PaperBroker
-from bot.strategies import STRATEGIES, signals
+from bot.strategies import STRATEGIES, signal_details, signals
 
 
 def config(**overrides):
@@ -53,7 +53,7 @@ class StrategyTests(unittest.TestCase):
         for strategy in STRATEGIES:
             with self.subTest(strategy=strategy):
                 full = signals(history, strategy)
-                for end in (14, 27, 40, 70):
+                for end in (14, 25, 26, 27, 40, 70):
                     self.assertEqual(signals(history[:end], strategy), full[:end])
 
     def test_candidates_have_documented_behavior(self):
@@ -62,6 +62,52 @@ class StrategyTests(unittest.TestCase):
         breakout = candles(["100"] * 25 + ["110"])
         self.assertEqual(signals(breakout, "breakout")[-1], "buy")
         self.assertTrue(all(value == "hold" for value in signals(breakout[:26], "ema_cross")))
+
+    def test_hybrid_requires_two_consistent_indicator_votes(self):
+        fixtures = (
+            (["100", "101"] * 12 + ["100", "102"], "buy", {"ema_trend": 1, "rsi": 0, "breakout": 1}),
+            (["100", "99"] * 12 + ["100", "98"], "sell", {"ema_trend": -1, "rsi": 0, "breakout": -1}),
+        )
+        for prices, expected, votes in fixtures:
+            with self.subTest(signal=expected):
+                history = candles(prices)
+                details = signal_details(history, "hybrid")
+                self.assertTrue(details["ready"])
+                self.assertEqual(details["votes"], votes)
+                self.assertEqual(details["signal"], expected)
+                self.assertEqual(signals(history, "hybrid")[-1], expected)
+
+    def test_hybrid_opposing_rsi_vote_vetoes_two_momentum_votes(self):
+        for price, votes in (("101", {"ema_trend": 1, "rsi": -1, "breakout": 1}),
+                             ("99", {"ema_trend": -1, "rsi": 1, "breakout": -1})):
+            with self.subTest(price=price):
+                history = candles(["100"] * 25 + [price])
+                details = signal_details(history, "hybrid")
+                self.assertEqual(details["votes"], votes)
+                self.assertEqual(details["signal"], "hold")
+                self.assertEqual(signals(history, "hybrid")[-1], "hold")
+
+    def test_hybrid_waits_for_all_indicators_to_warm_up(self):
+        history = candles(["100", "101"] * 12 + ["100", "102"])
+        for length in (0, 1, 14, 20, 25):
+            with self.subTest(candles=length):
+                details = signal_details(history[:length], "hybrid")
+                self.assertFalse(details["ready"])
+                self.assertEqual(details["signal"], "hold")
+                self.assertTrue(all(signal == "hold" for signal in signals(history[:length], "hybrid")))
+        self.assertEqual(signals(history, "hybrid")[-1], "buy")
+        # RSI and breakout can agree before EMA 26 is ready; that must not
+        # bypass the shared warm-up requirement.
+        early = candles(["1000"] + ["100"] * 23 + ["101"])
+        self.assertEqual(signals(early, "hybrid")[-1], "hold")
+        self.assertFalse(signal_details(early, "hybrid")["ready"])
+
+    def test_hybrid_single_vote_and_equal_previous_high_do_not_trigger(self):
+        history = candles(["100", "101"] * 12 + ["100", "101"])
+        details = signal_details(history, "hybrid")
+        self.assertEqual(details["votes"], {"ema_trend": 1, "rsi": 0, "breakout": 0})
+        self.assertEqual(details["buy_votes"], 1)
+        self.assertEqual(details["signal"], "hold")
 
 
 class BacktestTests(unittest.TestCase):
@@ -126,11 +172,30 @@ class BacktestTests(unittest.TestCase):
         history, settings = candles(), config()
         original = copy.deepcopy((history, settings))
         result = compare_strategies(history, settings)
+        self.assertEqual(len(result["results"]), 4)
         self.assertEqual([row["strategy"] for row in result["results"]], list(STRATEGIES))
         self.assertTrue(all(row["test_start"] == result["test_start"] for row in result["results"]))
         self.assertEqual(len({row["hold_return_pct"] for row in result["results"]}), 1)
         self.assertEqual((history, settings), original)
         self.assertTrue(result["notes"])
+
+    def test_real_hybrid_signal_opens_next_bar_and_closes_with_all_costs(self):
+        # Only the final observation candle breaks above 20 prior highs while
+        # EMA is rising and RSI stays neutral. No indicator or signal is mocked.
+        history = candles(["100", "101"] * 34 + ["100", "102"] + ["103"] * 30)
+        self.assertEqual(signals(history, "hybrid")[69], "buy")
+        result = run_backtest(history, config(), "hybrid")
+        expected = PaperBroker(config())
+        expected.buy("103", history[70]["open_time"])
+        expected.sell("103", history[-1]["close_time"])
+        self.assertEqual(result["strategy"], "hybrid")
+        self.assertEqual(result["strategy_name"], "Karma strateji")
+        self.assertEqual(result["train_candles"], 70)
+        self.assertEqual(result["trade_count"], 1)
+        self.assertEqual(result["trades"][0]["opened_at"], history[70]["open_time"].replace("+00:00", "Z"))
+        self.assertEqual(Decimal(result["final_equity"]), Decimal(expected.snapshot("103")["equity"]))
+        self.assertLess(Decimal(result["net_pnl"]), 0)  # Flat fills still pay costs.
+        self.assertTrue(any("Karma strateji" in note for note in result["notes"]))
 
     def test_invalid_ohlc_or_overlapping_candles_are_rejected(self):
         bad = candles()

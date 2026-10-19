@@ -21,6 +21,10 @@ STRATEGIES = {
         "name": "20 mum kırılımı",
         "description": "Önceki 20 mumun tepesini aşınca al; önceki 10 mumun dibinde sat.",
     },
+    "hybrid": {
+        "name": "Karma strateji",
+        "description": "EMA 12/26 trendi, RSI 14 (≤35 al / ≥65 sat) ve önceki 20 tepe / 10 dip kırılımı oy verir. En az iki aynı yönlü oy ve sıfır karşı oy varsa işlem; çelişkide veya ilk 26 mum dolmadan bekle.",
+    },
 }
 
 
@@ -71,6 +75,40 @@ def _rsi(values, period=14):
     return result
 
 
+def _hybrid_details(candles, closes=None):
+    """Causal voting; an opposing vote vetoes an entry or a strategy exit.
+
+    EMA uses its current trend rather than just the one-candle crossing event.
+    RSI and breakout votes deliberately keep their own fixed thresholds. Broker
+    stop-loss/trailing protections remain independent of a strategy's hold vote.
+    """
+    closes = closes if closes is not None else [_number(candle["close"]) for candle in candles]
+    fast, slow, rsi = _ema(closes, 12), _ema(closes, 26), _rsi(closes)
+    highs = [_number(candle["high"]) for candle in candles]
+    lows = [_number(candle["low"]) for candle in candles]
+    result = []
+    for index in range(len(candles)):
+        votes = {"ema_trend": 0, "rsi": 0, "breakout": 0}
+        ready = index >= 25  # The longest prerequisite is the 26-candle EMA.
+        if ready:
+            votes["ema_trend"] = 1 if fast[index] > slow[index] else -1 if fast[index] < slow[index] else 0
+            votes["rsi"] = 1 if rsi[index] <= 35 else -1 if rsi[index] >= 65 else 0
+            if closes[index] > max(highs[index - 20:index]):
+                votes["breakout"] = 1
+            elif closes[index] < min(lows[index - 10:index]):
+                votes["breakout"] = -1
+        buy_votes = sum(vote > 0 for vote in votes.values())
+        sell_votes = sum(vote < 0 for vote in votes.values())
+        decision = "hold"
+        if ready and buy_votes >= 2 and sell_votes == 0:
+            decision = "buy"
+        elif ready and sell_votes >= 2 and buy_votes == 0:
+            decision = "sell"
+        result.append({"strategy": "hybrid", "signal": decision, "ready": ready,
+                       "votes": votes, "buy_votes": buy_votes, "sell_votes": sell_votes})
+    return result
+
+
 def signals(candles, name):
     """Return one buy/sell/hold signal per closed candle, with no future reads."""
     if name not in STRATEGIES:
@@ -90,7 +128,7 @@ def signals(candles, name):
                 result[index] = "buy"
             elif value is not None and value >= 60:
                 result[index] = "sell"
-    else:
+    elif name == "breakout":
         highs = [_number(candle["high"]) for candle in candles]
         lows = [_number(candle["low"]) for candle in candles]
         for index in range(20, len(candles)):
@@ -98,7 +136,30 @@ def signals(candles, name):
                 result[index] = "buy"
             elif closes[index] < min(lows[index - 10:index]):
                 result[index] = "sell"
+    else:
+        result = [detail["signal"] for detail in _hybrid_details(candles, closes)]
     return result
+
+
+def signal_details(candles, name="hybrid"):
+    """Explain the latest closed-candle signal; votes are -1, 0 or +1.
+
+    Hybrid votes require all indicators to be warm. For an individual strategy,
+    the sole vote is that strategy's existing signal, with no altered thresholds.
+    """
+    if name not in STRATEGIES:
+        raise ValueError("Bilinmeyen strateji: " + str(name))
+    if name == "hybrid":
+        details = _hybrid_details(candles)
+        return details[-1] if details else {"strategy": name, "signal": "hold", "ready": False,
+                                           "votes": {"ema_trend": 0, "rsi": 0, "breakout": 0},
+                                           "buy_votes": 0, "sell_votes": 0}
+    sequence = signals(candles, name)
+    decision = sequence[-1] if sequence else "hold"
+    vote = {"buy": 1, "hold": 0, "sell": -1}[decision]
+    minimum = {"ema_cross": 27, "rsi_reversion": 15, "breakout": 21}[name]
+    return {"strategy": name, "signal": decision, "ready": len(candles) >= minimum,
+            "votes": {name: vote}, "buy_votes": int(vote > 0), "sell_votes": int(vote < 0)}
 
 
 def signal_for(name, candles):

@@ -1,6 +1,6 @@
 # Binance Spot deneme botu
 
-Türkçe panelden yönetilen, tek USDT işlem çiftinde otomatik **deneme alım/satımı** yapan uygulama. İşlem ve toplam net kâr/zarar, komisyonlar, sabit zarar durdurma ve iki farklı kâr takip modu içerir. Gerçek emir göndermez; API anahtarı veya borsa hesabı gerektirmez. Stratejilerin gelecekteki kârı garanti edilmez.
+Türkçe panelden yönetilen, birden fazla Binance Spot USDT paritesinde otomatik ve manuel **deneme alım/satımı** yapan uygulama. Tüm pozisyonlar ortak USDT bakiyesini kullanır; her pozisyonun alış fiyatı, stopu ve kâr takip zirvesi ayrıdır. İşlem bazında ve toplam net kâr/zararı, komisyonları ve açık pozisyonları gösterir. Gerçek emir göndermez; API anahtarı veya borsa hesabı gerektirmez. En yüksek kârı sağlayan veya gelecekte kâr garantileyen bir strateji iddiası yoktur.
 
 ## Windows için ZIP indir
 
@@ -42,11 +42,19 @@ python3 -m unittest discover -s tests -v
 
 ## Kullanım ve varsayılanlar
 
-EMA 12/26 kesişimi, RSI 14 dönüşü ve 20 mum kırılımı stratejileri karşılaştırılabilir. Sinyaller kapanmış mumları kullanır; uygulama açık pozisyon varken ikinci alış yapmaz. Kaldıraç, açığa satış ve çoklu pozisyon bulunmaz.
+**Tüm pariteler** modu, Binance kataloğunda işlem durumu `TRADING`, Spot işlem izni açık ve kotasyon varlığı USDT olan bütün pariteleri tarar. **Yalnız seçtiğim pariteler** modunda arama listesinden belirlediğiniz pariteler taranır. Sentetik demo kaynağında bu liste yalnızca 10 örnek pariteden oluşur.
+
+Grafikte seçtiğiniz parite yalnızca görüntüleme odağıdır; otomatik tarama evrenini veya açık pozisyonları değiştirmez. Farklı varlıklarda aynı anda pozisyon açılabilir; aynı paritede ikinci pozisyon veya mevcut miktara ek alış yapılmaz. Kaldıraç ve açığa satış yoktur.
+
+Dört strateji bulunur: EMA 12/26 kesişimi, RSI 14 dönüşü, 20 mum kırılımı ve **Karma strateji**. Karma stratejide EMA 12/26 trendi, RSI 14 (≤35 alış / ≥65 satış) ve önceki 20 mumun tepesi / 10 mumun dibi kırılımı oy verir. **En az iki aynı yönlü oy ve sıfır karşı oy** varsa işlem sinyali oluşur; çelişkide veya ilk 26 mum dolmadan beklenir. Koruyucu stoplar bu oylamadan bağımsızdır. Sinyaller kapanmış mumları kullanır.
+
+Aşağıdaki değerler yeni oluşturulan deneme veritabanı içindir; kayıtlı ayarlar güncellemede korunur.
 
 | Ayar | Varsayılan |
 | --- | --- |
-| İşlem çifti / mum / strateji | BTCUSDT / 5 dakika / EMA 12/26 |
+| Tarama evreni | Tüm aktif Binance Spot USDT pariteleri |
+| Grafik odağı / mum / strateji | BTCUSDT / 5 dakika / Karma strateji |
+| En fazla açık pozisyon | 5; ortak USDT bakiyesine bağlı |
 | Deneme başlangıç bakiyesi | 10.000 USDT |
 | Alış bütçesi, alış ücreti dahil | 1.000 USDT; kullanılabilir nakitle sınırlı |
 | Alış / satış komisyonu | Her yönde %0,10 |
@@ -58,11 +66,21 @@ EMA 12/26 kesişimi, RSI 14 dönüşü ve 20 mum kırılımı stratejileri karş
 | Günlük zarar sınırı | Gün başlangıcı özkaynağının %5'i |
 | Günlük saat dilimi | Europe/Istanbul |
 
-Asıl varsayılanlar `bot/core.py` içindeki `DEFAULT_CONFIG` ve `bot/service.py` içindeki `APP_DEFAULTS` değerleridir. Ayarları değiştirmek için botu duraklatın ve açık deneme pozisyonunu kapatın. İşlem geçmişi oluştuktan sonra çift/veri kaynağı veya başlangıç bakiyesi değişikliği için deneme defterini sıfırlayın. Sıfırlama önceki deneme bakiyesini ve görünür işlem geçmişini temizler.
+Asıl varsayılanlar `bot/core.py` içindeki `DEFAULT_CONFIG` ve `bot/service.py` içindeki `APP_DEFAULTS` değerleridir. Grafik odağı çalışırken değiştirilebilir. Diğer ayarlar için botu duraklatın ve açık deneme pozisyonlarını kapatın. İşlem geçmişi oluştuktan sonra veri kaynağı veya başlangıç bakiyesi değişikliği için deneme defterini sıfırlayın. Sıfırlama önceki deneme bakiyesini ve görünür işlem geçmişini temizler.
 
-**Komisyonlar tahmindir.** Alanlarda `0.10`, **%0,10** anlamına gelir. Binance hesabının güncel komisyonu otomatik sorgulanmaz; hesap seviyesi, kampanya ve BNB indirimleri uygulanmaz. Ücretlerin USDT ödendiği varsayılır. Kayma alış fiyatını yükseltir, satış fiyatını düşürür. Binance miktar adımı ve minimum emir tutarı alış miktarına uygulanır; emir defteri derinliği ve kısmi gerçekleşmeler modellenmez.
+Fiyat döngüsü her turdan sonra 5 saniye bekler; ağ yanıt süresi bu aralığı uzatabilir. Tek bir toplu fiyat isteğiyle gelen güncel fiyatlarda bütün açık pozisyonların stopları, mum taraması ve yeni strateji işlemlerinden önce değerlendirilir. Mumlar kademeli taranır: en fazla 12 bekleyen iş, 4 çalışan ve açık pozisyonlara öncelik vardır. Geniş bir evrenin tamamının aynı anda veya her 5 saniyede tarandığı varsayılmamalıdır. Panel durumu 3 saniyede bir yeniler; taranan ve bekleyen parite sayıları panelde görünür. Borsa istek sınırına ulaşıldığında belirtilen bekleme süresine uyulur.
 
-Gerçekleşmiş kâr/zarar, net satış geliri eksi alış maliyetidir; alış ve satış ücretleri dahildir. Açık kâr/zarar, mevcut pozisyonun satış ücreti ve kayma sonrası tahmini tasfiye değerinden hesaplanır. Toplam, gerçekleşmiş ve açık kâr/zararın toplamıdır. İşlem getiri yüzdesi alış maliyetine, toplam getiri yüzdesi başlangıç bakiyesine göredir.
+**Komisyonlar tahmindir.** Alanlarda `0.10`, **%0,10** anlamına gelir. Binance hesabının güncel komisyonu otomatik sorgulanmaz; hesap seviyesi, kampanya ve BNB indirimleri uygulanmaz. Ücretlerin USDT ödendiği varsayılır. Kayma alış fiyatını yükseltir, satış fiyatını düşürür. Binance miktar adımı ile uygulanabilir minimum/maksimum miktar ve emir tutarı kuralları alışa uygulanır; emir defteri derinliği ve kısmi gerçekleşmeler modellenmez.
+
+Gerçekleşmiş kâr/zarar, net satış geliri eksi alış maliyetidir; alış ve satış ücretleri dahildir. Açık kâr/zarar, pozisyonların satış ücreti ve kayma sonrası tahmini tasfiye değerinden hesaplanır. Toplam, gerçekleşmiş ve açık kâr/zararın toplamıdır. İşlem getiri yüzdesi ilgili alış maliyetine, toplam getiri yüzdesi portföyün başlangıç bakiyesine göredir.
+
+## Manuel AL / SAT ve acil durdurma
+
+**Manuel AL / SAT**, otomasyon açıkken de kullanılabilir. Pariteyi seçip alış için komisyon dahil USDT bütçesini girin. **SAT**, seçili paritedeki açık miktarın tamamını kapatır; kısmi satış yapılmaz. Manuel işlemler de ortak bakiye, açık pozisyon sayısı, borsa filtreleri ve günlük zarar sınırına tabidir. Güncel fiyat olmadan işlem yapılmaz. Manuel AL/SAT sonrasında ilgili paritede, işlemden sonra kapanacak yeni mum gelene kadar eski mum sinyali yeniden kullanılmaz; sabit stop, kâr takibi ve günlük risk kontrolleri sürer.
+
+**ACİL DURDUR / TÜMÜNÜ KAPAT**, önce otomasyonu durdurur ve kalıcı acil kilidini kaydeder. Sonra güncel fiyatı olan deneme pozisyonlarını kapatır. Fiyatı eski veya eksik olan pozisyonlar kapanmış sayılmaz; panelde bekleyen olarak görünür ve güncel fiyat akışı döndüğünde kapatma yeniden denenir. Bu sırada normal koruyucu çıkışlar da çalışır. Uygulama yeniden başlatılsa da acil kilidi korunur.
+
+Acil kilit açıkken **Başlat** ve manuel **AL** engellenir. Bütün pozisyonlar kapandıktan sonra **Acil kilidini kaldır** ile kilidi açıkça kaldırın. Bot duraklatılmış kalır; otomasyonu yeniden açmak için ayrıca **Başlat** gerekir. Günlük zarar kilidi gibi diğer risk sınırları bu işlemle kaldırılmaz.
 
 ## Stoplar ve kalıcı kayıt
 
@@ -73,18 +91,33 @@ Sabit stop, seçili takip moduyla birlikte çalışır. `stop_loss_pct=0` sabit 
 
 Takip modu, net kâr aktivasyon eşiğine ulaşıldıktan sonra devreye girer. Koruyucu çıkışlar strateji sinyalinden önce değerlendirilir; aynı fiyat gözleminde stop sonrası yeniden alış yapılmaz. Stoplar gözlenen fiyat üzerinden simüle edilir; fiyat boşluğunda stop eşiğinden gerçekleşme garantisi yoktur.
 
-Günlük limit açık zarar ve ücretleri de kapsar; aşılınca pozisyon kapanır ve o gün yeni alışlar kilitlenir. Yeni gün İstanbul saatine göre başlar. Taşınan pozisyonda günlük özkaynak başlangıcı, yeni günün ilk başarılı fiyat gözlemidir.
+Her varlığın sabit stopu ve kâr takibi bağımsızdır. Günlük zarar sınırı ise ortak portföyün toplam özkaynağına uygulanır; açık zarar ve ücretleri de kapsar. Aşılınca güncel fiyatı olan pozisyonlar kapatılır, fiyatı eksik olanlar güncel veri gelene kadar risk çıkışı için bekler ve yeni alışlar kilitlenir. Yeni gün İstanbul saatine göre başlar; taşınan pozisyonlarda günlük başlangıç, tüm açık pozisyonların fiyatının bulunduğu ilk başarılı gözlemdir. Bekleyen risk çıkışları tamamlanmadan kilit erken kaldırılmaz.
 
-Veriler varsayılan olarak **`.data/paper.sqlite3`** içinde saklanır. Yeniden başlatmada bakiye, işlemler, açık pozisyon, takip zirveleri ve günlük kilit geri yüklenir; yeni strateji işlemleri duraklatılmış başlar. **Duraklatma sırasında fiyat takibi ve açık pozisyon stopları çalışmaya devam eder. Süreç kapalıysa veya güncel ağ verisi alınamıyorsa stop koruması çalışmaz.** Bunlar borsaya gönderilmiş koruyucu emirler değildir.
+Veriler varsayılan olarak **`.data/paper.sqlite3`** içinde saklanır. Yeniden başlatmada ortak bakiye, işlemler, açık pozisyonlar, takip zirveleri, günlük kilit ve varsa acil kilidi geri yüklenir; yeni strateji işlemleri duraklatılmış başlar. **Duraklatma sırasında fiyat takibi ve açık pozisyon stopları çalışmaya devam eder. Süreç kapalıysa veya ilgili varlığın güncel fiyatı alınamıyorsa o pozisyonun stopu çalışmaz.** Bunlar borsaya gönderilmiş koruyucu emirler değildir.
+
+Bir açık pozisyonun fiyatı eksikse yeni alışlar engellenir; güncel fiyatı gelen diğer pozisyonların koruyucu kontrolleri sürer. Ekranda son bilinen fiyatla gösterilen değerler güncel işlem fiyatı sayılmaz; eski fiyatla satış yapılmaz.
 
 Farklı veritabanı için `--db /istenen/yol/paper.sqlite3` kullanabilirsiniz. Yedek alırken uygulamayı kapatıp `.data` klasörünü bütün olarak kopyalayın.
 
+## Eski sürümden güncelleme
+
+Eski tek pozisyonlu v1 SQLite kaydı ilk açılışta otomatik olarak çoklu portföye aktarılır. Önce aynı dizinde `*.v1-backup-*.sqlite3` biçiminde bir SQLite yedeği alınır. Nakit, işlem geçmişi, ücretler, açık pozisyon, takip zirveleri ve günlük risk durumu korunur; otomasyon duraklatılmış açılır. Eski strateji ayarı EMA ise korunur. Karma stratejiye geçmek için pozisyonlar kapalı ve bot duraklatılmışken ayarlardan **Karma strateji** seçin.
+
+Windows'ta en kolay güncelleme yolu:
+
+1. Eski botun konsolunda `Ctrl+C` ile uygulamayı durdurun ve konsolu kapatın.
+2. Yeni ZIP'i yeni bir klasöre çıkarın.
+3. Yeni botu açmadan önce eski klasördeki **`.data` klasörünün tamamını** yeni uygulama klasörüne kopyalayın. Kopyalama sırasında iki uygulama da kapalı olmalıdır.
+4. Yeni klasördeki **BASLAT.bat** dosyasını açın; kayıt aktarımından sonra ayarları ve pozisyonları kontrol edin.
+
+Aynı klasörde güncelliyorsanız önce konsolu kapatın, kod dosyalarını yenileyin ve mevcut `.data` klasörünü koruyun. Çalışan uygulamanın veritabanı üzerine dosya kopyalamayın. Windows başlatıcısı bu Linux bulut ortamında çalıştırılmamıştır.
+
 ## Geçmiş test ve geliştirme
 
-Geçmiş test aynı veri, bütçe, ücret ve kaymayla üç sabit stratejiyi değerlendirir. İlk %70 gösterge ısınması/gözlem, son %30 değerlendirmedir; parametre optimizasyonu yapılmaz. Sinyal kapanmış mumdan üretilir ve sonraki mum açılışında uygulanır. Her mum için açılış→düşük→yüksek→kapanış ve açılış→yüksek→düşük→kapanış yolları simüle edilir; kapanış net tasfiye değeri düşük olan yol seçilir. Bu iki yol bütün olası fiyat yollarını kapsamaz. Seçilen yolun ara değerleri azami düşüşe dahildir; son kapanışta açık pozisyon tasfiye edilir.
+Geçmiş test, grafikte odaklanılan **tek parite** için aynı veri, bütçe, ücret ve kaymayla Karma dahil dört sabit stratejiyi değerlendirir; çoklu portföy testi değildir. İlk %70 gösterge ısınması/gözlem, son %30 değerlendirmedir; parametre optimizasyonu yapılmaz. Sinyal kapanmış mumdan üretilir ve sonraki mum açılışında uygulanır. Her mum için açılış→düşük→yüksek→kapanış ve açılış→yüksek→düşük→kapanış yolları simüle edilir; kapanış net tasfiye değeri düşük olan yol seçilir. Bu iki yol bütün olası fiyat yollarını kapsamaz. Seçilen yolun ara değerleri azami düşüşe dahildir; son kapanışta açık pozisyon tasfiye edilir.
 
 Raporda net getiri, azami düşüş, işlem sayısı, kazanma oranı, ücretler ve aynı bütçe/maliyetlerle al-tut karşılaştırması bulunur. Kısa örneklem ve sentetik verideki kazanç, strateji seçimi için yeterli kanıt değildir. Test raporu bot stratejisini kendiliğinden değiştirmez.
 
-Geliştirme girişleri: `bot/core.py` para/risk hesabı, `bot/strategies.py` sinyaller, `bot/market.py` veri, `bot/backtest.py` test, `bot/service.py` kalıcılık/iş döngüsü ve `static/` paneldir. Parasal JSON alanları `Decimal` hassasiyetini korumak için dizge olarak iletilir. Durum `GET /api/state`, sağlık `GET /api/health`, ayarlar `PATCH /api/config`, kontroller `POST /api/control`, geçmiş test `POST /api/backtest` uçlarındadır. Sunucu yerel geliştirme içindir; varsayılan yerel dinleme adresini koruyun.
+Geliştirme girişleri: `app.py` HTTP sunucusu, `bot/portfolio.py` ortak bakiye ve portföy riskleri, `bot/core.py` pozisyon stopları ve para hesabı, `bot/strategies.py` sinyaller, `bot/market.py` katalog/fiyat/mum verisi, `bot/backtest.py` tek parite testi, `bot/service.py` kalıcılık ve tarama döngüsü, `static/` paneldir. Parasal JSON alanları `Decimal` hassasiyetini korumak için dizge olarak iletilir. Durum `GET /api/state`, pariteler `GET /api/symbols`, sağlık `GET /api/health`, ayarlar `PATCH /api/config`, kontroller `POST /api/control`, geçmiş test `POST /api/backtest` uçlarındadır. Manuel kontroller `{"action":"buy","symbol":"BTCUSDT","amount":"100"}` ve `{"action":"sell","symbol":"BTCUSDT"}`; acil kontroller `{"action":"emergency_close"}` ve `{"action":"clear_emergency"}` JSON gövdelerini kullanır. Sunucu yerel geliştirme içindir; varsayılan yerel dinleme adresini koruyun.
 
 Bu uygulama bağımsız `dereli2002/AL-SAT` GitHub deposundadır. Bulut çalışma klasörü `/workspace/crypto-spot-bot` yoludur. İş ve Performans Takip uygulamasının dosyalarıyla veya geçmişiyle birleştirilmez. Başka ortama aktarırken uygulama klasörünün tamamını taşıyın; panel dosyalarını tek tek kopyalamanız gerekmez.

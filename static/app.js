@@ -3,11 +3,12 @@
 const $ = (id) => document.getElementById(id);
 const configForm = $('configForm');
 const strategies = {
+  hybrid: { name: 'Karma strateji', description: 'EMA, RSI ve kırılım oylarını birleştirir. En az iki uyumlu oy ve karşı oy yoksa işlem yapar.' },
   ema_cross: { name: 'EMA kesişimi', description: 'Kısa ve uzun dönem ortalamalarının kesişimini izler.' },
   rsi_reversion: { name: 'RSI dönüşü', description: 'Aşırı satım sonrası toparlanma sinyallerini izler.' },
   breakout: { name: 'Fiyat kırılımı', description: 'Önceki fiyat aralığının üzerindeki kırılımı izler.' },
 };
-const reasonNames = { stop_loss: 'Alış altı stop', fixed_stop: 'Alış altı stop', trailing_stop: 'Kâr takibi stop', trailing_price: 'Fiyat takibi stop', trailing_profit: 'Net kâr takibi', strategy: 'Strateji sinyali', signal: 'Strateji sinyali', sell_signal: 'Satış sinyali', manual: 'Manuel kapatma', manual_close: 'Manuel kapatma', daily_loss: 'Günlük risk limiti', daily_loss_limit: 'Günlük risk limiti', end_of_test: 'Test sonu', backtest_end: 'Test sonu' };
+const reasonNames = { stop_loss: 'Alış altı stop', fixed_stop: 'Alış altı stop', trailing_stop: 'Kâr takibi stop', trailing_price: 'Fiyat takibi stop', trailing_profit: 'Net kâr takibi', strategy: 'Strateji sinyali', signal: 'Strateji sinyali', sell_signal: 'Satış sinyali', manual: 'Manuel', manual_buy: 'Manuel alış', manual_sell: 'Manuel satış', manual_close: 'Manuel kapatma', emergency: 'Acil kapatma', emergency_close: 'Acil kapatma', daily_loss: 'Günlük risk limiti', daily_loss_limit: 'Günlük risk limiti', end_of_test: 'Test sonu', backtest_end: 'Test sonu' };
 const formatNumber = new Intl.NumberFormat('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const formatPrice = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 8 });
 const formatQuantity = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 8 });
@@ -20,6 +21,193 @@ let fetching = false;
 let toastTimer;
 let chartKey = '';
 let chartPoints = [];
+let catalogue = [];
+let selectedSymbols = new Set();
+let symbolsLoading = false;
+let catalogueRequestedFor = '';
+let symbolListKey = '';
+let marketSummaryKey = '';
+let lastStateSuccessAt = null;
+let networkHealthy = false;
+let manualSymbolTouched = false;
+let manualAmountTouched = false;
+let focusDirty = false;
+let emergencyBusy = false;
+let fillsInitialized = false;
+let seenEntries = new Set();
+let seenExits = new Set();
+let previousClosedCount = 0;
+let fillNotificationVersion = 0;
+let emergencyVersion = 0;
+
+function instant(value) {
+  if (!value) return null;
+  const parsed = new Date(typeof value === 'number' && value < 1e12 ? value * 1000 : value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+}
+
+function entryKey(item) {
+  return `${item.symbol || state?.config?.symbol}|${item.trade_id ?? item.id ?? ''}|${item.opened_at || ''}`;
+}
+
+function observeFills(current) {
+  const positions = positionsOf(current);
+  const trades = Array.isArray(current.trades) ? current.trades : [];
+  if (trades.length < previousClosedCount) { fillsInitialized = false; seenEntries = new Set(); seenExits = new Set(); }
+  const messages = [];
+  const addEntry = (item) => {
+    const key = entryKey(item);
+    if (!seenEntries.has(key) && fillsInitialized) messages.push(`AL ${item.symbol || current.config?.symbol} · ${price(item.entry_price)} USDT`);
+    seenEntries.add(key);
+  };
+  positions.forEach(addEntry);
+  trades.forEach((trade) => {
+    const key = `${entryKey(trade)}|${trade.closed_at || trade.exit_at || ''}`;
+    if (!seenExits.has(key)) {
+      // Also report an entry that opened and closed between two polling reads.
+      addEntry(trade);
+      if (fillsInitialized) messages.push(`SAT ${trade.symbol || current.config?.symbol} · net ${money(trade.pnl_quote ?? trade.net_pnl ?? trade.pnl, true)} USDT · ${reasonNames[trade.reason] || trade.reason || 'Kapatıldı'}`);
+    }
+    seenExits.add(key);
+  });
+  fillsInitialized = true;
+  previousClosedCount = trades.length;
+  if (messages.length) {
+    const summary = `Yeni deneme işlemi: ${messages.slice(0, 3).join(' | ')}${messages.length > 3 ? ` | +${messages.length - 3} işlem` : ''}`;
+    text('latestExecution', `${dateTime(Date.now())} · ${summary}`);
+    $('latestExecution').hidden = false;
+    fillNotificationVersion += 1;
+    toast(summary);
+  }
+}
+
+function manualContext() {
+  const symbol = $('manualSymbol').value.trim().toUpperCase();
+  const market = marketsOf().find((entry) => entry.symbol === symbol) || (state?.market?.symbol === symbol ? state.market : {});
+  const position = positionsOf().find((entry) => entry.symbol === symbol);
+  const stamp = instant(market.updated_at);
+  const fresh = Boolean(networkHealthy && state?.status?.fresh && numeric(market.price) > 0 && stamp && Date.now() - stamp < 30000 && lastStateSuccessAt && Date.now() - lastStateSuccessAt < 30000);
+  const known = catalogue.length > 0 && catalogue.some((entry) => entry.symbol === symbol);
+  return { symbol, market, position, fresh, known };
+}
+
+function updateManualControls() {
+  const context = manualContext();
+  const cash = numeric(state?.account?.cash);
+  const amount = numeric($('manualAmount').value);
+  const risk = state?.account?.risk || {};
+  const emergency = Boolean(state?.emergency?.active);
+  const maxPositions = numeric(state?.config?.max_open_positions) || 1;
+  const buyIssue = emergency ? 'Acil kilit etkin: yeni alışlar engellendi.' : !context.symbol ? 'İşlem yapmak için parite seçin.' : !context.known ? 'Katalogdan geçerli bir USDT paritesi seçin.' : !context.fresh ? 'Seçili parite için güncel ve başarılı fiyat akışı bekleniyor.' : context.position ? 'Bu paritede açık pozisyon var. Önce tamamını satabilirsiniz.' : risk.daily_halted ? 'Günlük zarar sınırı nedeniyle yeni alışlar kilitli.' : positionsOf().length >= maxPositions ? 'Açık pozisyon sınırına ulaşıldı.' : amount === null || amount <= 0 ? 'Pozitif bir USDT alış tutarı girin.' : cash === null || amount > cash ? 'Alış tutarı kullanılabilir USDT bakiyesini aşıyor.' : '';
+  $('manualBuyButton').disabled = requestBusy || emergencyBusy || Boolean(buyIssue);
+  $('manualBuyButton').title = buyIssue;
+  $('manualSellButton').disabled = requestBusy || emergencyBusy || !context.position || !context.fresh;
+  $('manualSellButton').title = !context.position ? 'Bu paritede açık pozisyon yok.' : !context.fresh ? 'Satış için güncel fiyat gerekli.' : 'Seçili pozisyonun tamamını sat.';
+  if (cash !== null) $('manualAmount').max = String(cash); else $('manualAmount').removeAttribute('max');
+  text('manualQuote', numeric(context.market.price) > 0 ? `Son fiyat: ${price(context.market.price)} USDT · ${context.fresh ? 'güncel' : 'güncel veri bekleniyor'}${context.market.error ? ' · strateji taramasında hata var' : ''}` : 'Güncel fiyat bekleniyor');
+  text('manualCash', `Kullanılabilir bakiye: ${money(cash)} USDT`);
+  text('manualAvailability', buyIssue || 'AL ve SAT kontrolü sizde. Emirler bu deneme hesabında uygulanır.');
+  text('manualPositionInfo', context.position ? `SAT: ${formatQuantity.format(numeric(context.position.quantity) || 0)} ${context.symbol.replace(/USDT$/, '')} miktarının tamamını kapatır.` : 'SAT, seçili paritenin açık miktarının tamamını kapatır.');
+}
+
+function renderEmergency(current) {
+  const emergency = current.emergency || {};
+  const pending = Array.isArray(emergency.pending_symbols) ? emergency.pending_symbols : [];
+  const open = positionsOf(current).length;
+  $('emergencyBanner').hidden = !emergency.active;
+  text('emergencyDetails', pending.length ? `${pending.length} pozisyon kapatma bekliyor: ${pending.join(', ')}. Güncel fiyat akışı geldiğinde kapatma yeniden denenir. Bot durduruldu; yeni alışlar kilitli.` : open ? `${open} açık pozisyon var. Kapatma durumu izleniyor; yeni alışlar kilitli.` : 'Tüm pozisyonlar kapalı. Yeni alışlar kilitli; otomasyon kendiliğinden yeniden başlamaz.');
+  $('emergencyError').hidden = !emergency.last_error;
+  text('emergencyError', emergency.last_error);
+}
+
+function positionsOf(current = state) {
+  if (Array.isArray(current?.positions)) return current.positions;
+  return current?.position ? [{ symbol: current.config?.symbol, ...current.position, unrealized_pnl: current.account?.unrealized_pnl }] : [];
+}
+
+function marketsOf(current = state) {
+  if (Array.isArray(current?.markets)) return current.markets;
+  return current?.market?.symbol ? [current.market] : [];
+}
+
+function focusedMarket(current) {
+  const symbol = current.config?.symbol;
+  const found = marketsOf(current).find((market) => market.symbol === symbol);
+  const legacy = current.market?.symbol === symbol ? current.market : {};
+  return { ...legacy, ...found, symbol, source: found?.source || legacy.source || current.config?.data_source, is_synthetic: current.config?.data_source === 'demo' };
+}
+
+function markConfigDirty() {
+  configDirty = true;
+  text('settingsState', 'Kaydedilmemiş değişiklikler');
+  updateCostEstimate();
+  updateButtons();
+}
+
+async function loadSymbols(force = false) {
+  const source = state?.config?.data_source || 'binance';
+  if (symbolsLoading || (!force && catalogueRequestedFor === source)) return;
+  catalogueRequestedFor = source;
+  symbolsLoading = true;
+  catalogue = [];
+  $('symbolOptions').replaceChildren();
+  symbolListKey = '';
+  text('catalogueStatus', 'İşlem yapılabilir USDT pariteleri yükleniyor…');
+  $('refreshSymbolsButton').disabled = true;
+  renderUniversePicker();
+  try {
+    const data = await api('/api/symbols');
+    if (source !== state?.config?.data_source) { catalogueRequestedFor = ''; return; }
+    catalogue = (Array.isArray(data.symbols) ? data.symbols : []).map((entry) => typeof entry === 'string' ? { symbol: entry, base_asset: entry.replace(/USDT$/, ''), quote_asset: 'USDT' } : entry).filter((entry) => entry.symbol).sort((a, b) => a.symbol.localeCompare(b.symbol));
+    const options = document.createDocumentFragment();
+    catalogue.forEach((entry) => { const option = document.createElement('option'); option.value = entry.symbol; option.label = `${entry.base_asset || entry.symbol.replace(/USDT$/, '')} / USDT`; options.append(option); });
+    $('symbolOptions').replaceChildren(options);
+    text('catalogueStatus', data.error || (data.is_synthetic ? 'Sentetik demo listesi: yalnız örnek pariteler. Binance’in tüm piyasa listesi değildir.' : `${catalogue.length} işlem yapılabilir Binance Spot USDT paritesi. Liste borsadan alınır.`));
+  } catch (error) {
+    text('catalogueStatus', `Parite listesi alınamadı: ${error.message} Listeyi yenileyerek tekrar deneyin.`);
+  } finally {
+    symbolsLoading = false;
+    $('refreshSymbolsButton').disabled = false;
+    symbolListKey = '';
+    renderUniversePicker();
+    updateManualControls();
+  }
+}
+
+function renderUniversePicker() {
+  const mode = configForm.elements.namedItem('universe_mode').value;
+  const all = mode === 'all';
+  const query = $('symbolSearch').value.trim().toUpperCase();
+  const key = `${all}|${query}|${[...selectedSymbols].sort().join(',')}|${catalogue.map((entry) => entry.symbol).join(',')}|${symbolsLoading}`;
+  text('catalogueCount', catalogue.length ? `${catalogue.length} parite` : symbolsLoading ? 'Yükleniyor' : 'Liste yok');
+  text('universeHelp', all ? 'Listelenen tüm işlem yapılabilir USDT pariteleri gruplar hâlinde taranır.' : 'İzlenecek pariteleri işaretleyin. En az bir parite seçilmelidir.');
+  text('selectionCount', all ? `${catalogue.length || '—'} paritenin tamamı izlenecek` : `${selectedSymbols.size} parite seçildi`);
+  $('clearSelectionButton').disabled = all || selectedSymbols.size === 0;
+  if (key === symbolListKey) return;
+  symbolListKey = key;
+  const visible = catalogue.filter((entry) => `${entry.symbol} ${entry.base_asset || ''}`.toUpperCase().includes(query));
+  const fragment = document.createDocumentFragment();
+  visible.forEach((entry) => {
+    const label = document.createElement('label'); label.className = 'asset-option';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = all || selectedSymbols.has(entry.symbol); input.disabled = all; input.setAttribute('aria-label', `${entry.symbol} paritesini izle`);
+    input.addEventListener('change', (event) => {
+      event.stopPropagation();
+      if (input.checked) selectedSymbols.add(entry.symbol); else selectedSymbols.delete(entry.symbol);
+      markConfigDirty();
+      // Preserve keyboard focus while updating selection counts and chips.
+      renderUniversePicker();
+      [...$('symbolList').querySelectorAll('input')].find((item) => item.getAttribute('aria-label') === input.getAttribute('aria-label'))?.focus({ preventScroll: true });
+    });
+    const name = document.createElement('span'); name.textContent = entry.base_asset || entry.symbol.replace(/USDT$/, '');
+    const pair = document.createElement('small'); pair.textContent = entry.symbol;
+    label.append(input, name, pair); fragment.append(label);
+  });
+  if (!visible.length) { const empty = document.createElement('p'); empty.className = 'symbol-list-empty'; empty.textContent = symbolsLoading ? 'Parite listesi yükleniyor…' : query ? 'Aramanızla eşleşen parite yok.' : 'Parite listesi henüz alınamadı.'; fragment.append(empty); }
+  $('symbolList').replaceChildren(fragment);
+  const chips = document.createDocumentFragment();
+  if (!all) [...selectedSymbols].sort().forEach((symbol) => { const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'asset-chip'; chip.textContent = `${symbol} ×`; chip.setAttribute('aria-label', `${symbol} seçimini kaldır`); chip.addEventListener('click', () => { selectedSymbols.delete(symbol); markConfigDirty(); renderUniversePicker(); }); chips.append(chip); });
+  $('selectedChips').replaceChildren(chips);
+}
 
 function numeric(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -42,7 +230,7 @@ function dateTime(value) {
   if (Number.isNaN(parsed.getTime())) return '—';
   return new Intl.DateTimeFormat('tr-TR', { timeZone: 'Europe/Istanbul', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(parsed);
 }
-function text(id, value) { $(id).textContent = value ?? '—'; }
+function text(id, value) { const element = $(id); const content = String(value ?? '—'); if (element.textContent !== content) element.textContent = content; }
 function paintValue(id, value, options = {}) {
   const el = $(id);
   el.textContent = `${money(value, options.signed)}${options.suffix || ''}`;
@@ -106,11 +294,15 @@ function updateChart(market) {
 function hydrateConfig(config) {
   if (configDirty && hasHydrated) return;
   Object.entries(config).forEach(([name, value]) => {
+    if (name === 'symbols') return;
     const input = configForm.elements.namedItem(name);
     if (input && value !== null && value !== undefined) input.value = String(value);
   });
+  if (!config.universe_mode) configForm.elements.namedItem('universe_mode').value = 'selected';
+  selectedSymbols = new Set(Array.isArray(config.symbols) ? config.symbols : [config.symbol || 'BTCUSDT']);
   hasHydrated = true;
   updateCostEstimate();
+  renderUniversePicker();
   text('settingsState', 'Kayıtlı ayarlar');
 }
 
@@ -126,15 +318,24 @@ function updateCostEstimate() {
 
 function render(current) {
   state = current;
+  networkHealthy = true;
+  lastStateSuccessAt = Date.now();
+  text('lastRefreshTime', `Son başarılı güncelleme: ${dateTime(lastStateSuccessAt)}`);
+  text('refreshStatus', 'Panel güncel · otomatik yenileme açık');
+  $('refreshStatus').className = '';
   const config = current.config || {};
   const account = current.account || {};
-  const market = current.market || {};
+  const market = focusedMarket(current);
   const status = current.status || {};
   const risk = account.risk || current.risk || {};
-  const position = current.position;
+  const positions = positionsOf(current);
   const trades = Array.isArray(current.trades) ? current.trades : [];
   const isDemo = Boolean(market.is_synthetic) || config.data_source === 'demo';
   hydrateConfig(config);
+  if (!focusDirty && document.activeElement !== $('focusSymbol')) $('focusSymbol').value = config.symbol || '';
+  if (!manualSymbolTouched && document.activeElement !== $('manualSymbol')) $('manualSymbol').value = config.symbol || '';
+  if (!manualAmountTouched && document.activeElement !== $('manualAmount')) $('manualAmount').value = config.order_quote_amount || '';
+  if (catalogueRequestedFor !== (config.data_source || 'binance') && !symbolsLoading) loadSymbols();
 
   text('equity', money(account.equity));
   text('initialCash', `Başlangıç: ${money(account.initial_cash)} USDT`);
@@ -142,7 +343,7 @@ function render(current) {
   text('totalPnlPct', percent(account.total_pnl_pct, true));
   $('totalPnlPct').className = numeric(account.total_pnl) < 0 ? 'negative' : numeric(account.total_pnl) > 0 ? 'positive' : '';
   paintValue('realizedPnl', account.realized_pnl, { signed: true, color: true });
-  text('tradeCount', `${trades.length} kapanan işlem`);
+  text('tradeCount', `${account.trade_count ?? trades.length} kapanan işlem · tüm pariteler`);
   text('feesPaid', money(account.fees_paid));
   text('feeSummary', `Alış ${percent(config.buy_fee_pct)} · Satış ${percent(config.sell_fee_pct)}`);
   text('cashBalance', `${money(account.cash)} USDT`);
@@ -160,7 +361,7 @@ function render(current) {
   const strategy = strategies[config.strategy] || { name: config.strategy || '—', description: '' };
   text('activeStrategy', strategy.name);
   text('strategyDescription', strategy.description);
-  text('backtestContext', `${config.symbol || '—'} · ${config.interval || '—'} · ${isDemo ? 'Sentetik demo' : 'Binance piyasa verisi'}`);
+  text('backtestContext', `${config.symbol || '—'} · ${config.interval || '—'} · ${isDemo ? 'Sentetik demo' : 'Binance'} · tek parite`);
   const dailyPnl = numeric(risk.daily_pnl);
   text('dailyRisk', risk.daily_halted ? 'Zarar limiti: yeni alışlar durdu' : dailyPnl === null ? 'Limit etkin' : `${money(dailyPnl, true)} USDT · Limit ${percent(config.daily_loss_limit_pct)}`);
   $('dailyRisk').className = risk.daily_halted ? 'negative' : '';
@@ -173,36 +374,102 @@ function render(current) {
   $('connectionStatus').className = `connection ${errors.length || stale ? 'offline' : status.fresh ? 'online' : ''}`;
   $('connectionStatus').replaceChildren(document.createElement('i'), document.createTextNode(errors.length ? 'Veri hatası' : stale ? 'Veri gecikiyor' : status.fresh ? 'Veri akışı bağlı' : 'Veri bekleniyor'));
 
-  $('emptyPosition').hidden = Boolean(position);
-  $('positionDetails').hidden = !position;
-  text('positionBadge', position ? '1 aktif pozisyon' : 'Yok');
-  if (position) {
-    text('entryPrice', `${price(position.entry_price)} USDT`);
-    text('positionQuantity', formatQuantity.format(numeric(position.quantity) || 0));
-    paintValue('unrealizedPnl', account.unrealized_pnl, { signed: true, color: true, suffix: ' USDT' });
-    text('fixedStop', `${price(position.fixed_stop_price)} USDT`);
-    text('trailingStop', position.trailing_active ? `${price(position.trailing_stop_price)} USDT` : 'Etkinleşmesi bekleniyor');
-    text('trailingState', position.trailing_active ? (config.trailing_mode === 'net_profit' ? 'En yüksek net kâr takip ediliyor' : 'En yüksek fiyat takip ediliyor') : `Net getiri ${percent(config.trailing_activation_pct)} olunca etkinleşir`);
-    text('highestPrice', `${price(position.highest_price)} USDT`);
-  }
+  $('emptyPosition').hidden = positions.length > 0;
+  $('positionDetails').hidden = positions.length === 0;
+  text('positionBadge', `${positions.length} aktif pozisyon`);
+  text('positionLimit', config.max_open_positions ?? '1');
+  paintValue('unrealizedPnl', account.unrealized_pnl, { signed: true, color: true, suffix: ' USDT' });
+  renderPositions(positions);
+  renderEmergency(current);
+  renderScanner(current);
   renderTrades(trades);
   renderBacktest(current.backtest);
   updateChart(market);
+  observeFills(current);
   updateButtons();
 }
 
 function updateButtons() {
   const current = state || {};
   const running = Boolean(current.status?.running);
-  $('startButton').disabled = requestBusy || !state || running || configDirty;
-  $('startButton').title = configDirty ? 'Başlatmadan önce değişiklikleri kaydedin.' : '';
+  const positions = positionsOf(current);
+  const emergency = current.emergency || {};
+  const pending = Array.isArray(emergency.pending_symbols) ? emergency.pending_symbols : [];
+  $('startButton').disabled = requestBusy || emergencyBusy || !state || running || configDirty || Boolean(emergency.active);
+  $('startButton').title = emergency.active ? 'Başlatmadan önce acil kilidini kaldırın.' : configDirty ? 'Başlatmadan önce değişiklikleri kaydedin.' : '';
   $('pauseButton').disabled = requestBusy || !state || !running;
-  $('closeButton').disabled = requestBusy || !current.position;
-  $('resetButton').disabled = requestBusy || !state || running || Boolean(current.position);
-  $('saveButton').disabled = requestBusy || !state || running || Boolean(current.position);
-  $('saveButton').title = running || current.position ? 'Ayarlar için botu duraklatın ve açık pozisyonu kapatın.' : '';
+  $('closeButton').disabled = requestBusy || positions.length === 0;
+  $('resetButton').disabled = requestBusy || !state || running || positions.length > 0;
+  $('saveButton').disabled = requestBusy || !state || running || positions.length > 0;
+  $('saveButton').title = running || positions.length ? 'Ayarlar için botu duraklatın ve tüm açık pozisyonları kapatın.' : '';
+  $('focusButton').disabled = requestBusy || !state;
+  $('positionsBody').querySelectorAll('button').forEach((button) => { button.disabled = requestBusy; });
   $('backtestButton').disabled = backtestBusy || !state;
-  configForm.elements.namedItem('initial_cash').disabled = Boolean(current.position) || (Array.isArray(current.trades) && current.trades.length > 0);
+  $('emergencyButton').disabled = emergencyBusy;
+  $('clearEmergencyButton').disabled = requestBusy || emergencyBusy || !emergency.active || pending.length > 0 || positions.length > 0;
+  configForm.elements.namedItem('initial_cash').disabled = positions.length > 0 || (Array.isArray(current.trades) && current.trades.length > 0);
+  updateManualControls();
+}
+
+function renderPositions(positions) {
+  const tbody = $('positionsBody'); tbody.replaceChildren();
+  const marketMap = new Map(marketsOf().map((market) => [market.symbol, market]));
+  positions.forEach((position) => {
+    const row = document.createElement('tr');
+    const symbol = position.symbol || state.config?.symbol || '—';
+    const pairCell = addCell(row, symbol);
+    const quantity = document.createElement('small'); quantity.textContent = `${formatQuantity.format(numeric(position.quantity) || 0)} ${symbol.replace(/USDT$/, '')}`; pairCell.append(quantity);
+    const market = marketMap.get(symbol) || {};
+    const lastPrice = position.last_price ?? market.price;
+    const quoteMissing = Boolean(position.quote_missing) || numeric(lastPrice) === null;
+    const priceCell = addCell(row, `${price(position.entry_price)} / ${price(lastPrice)}`);
+    if (quoteMissing) { const warning = document.createElement('small'); warning.className = 'negative'; warning.textContent = 'Güncel kotasyon eksik'; priceCell.append(warning); }
+    let pnl = position.unrealized_pnl ?? position.net_pnl;
+    if (pnl === undefined && !quoteMissing) {
+      const cfg = state.config || {};
+      pnl = numeric(position.quantity) * numeric(lastPrice) * (1 - (numeric(cfg.slippage_pct) || 0) / 100) * (1 - (numeric(cfg.sell_fee_pct) || 0) / 100) - numeric(position.entry_cost);
+    }
+    const pnlCell = addCell(row, quoteMissing ? '—' : money(pnl, true), quoteMissing ? '' : numeric(pnl) > 0 ? 'positive' : numeric(pnl) < 0 ? 'negative' : '');
+    const pnlHint = document.createElement('small'); pnlHint.textContent = quoteMissing ? 'Son değerle toplamda yer alabilir' : 'Satış maliyeti düşülmüş'; pnlCell.append(pnlHint);
+    addCell(row, numeric(position.fixed_stop_price) === null ? 'Kapalı' : price(position.fixed_stop_price));
+    const trailing = addCell(row, position.trailing_active ? price(position.trailing_stop_price) : 'Eşik bekleniyor');
+    const trailingHint = document.createElement('small'); trailingHint.textContent = position.trailing_active ? state.config?.trailing_mode === 'net_profit' ? 'Net kâr takibi etkin' : 'Fiyat takibi etkin' : `${percent(state.config?.trailing_activation_pct)} net getiri eşiği`; trailing.append(trailingHint);
+    addCell(row, price(position.highest_price));
+    const action = document.createElement('td'); const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-danger button-small'; button.textContent = 'Kapat'; button.setAttribute('aria-label', `${symbol} deneme pozisyonunu kapat`); button.addEventListener('click', () => control('close_position', symbol)); action.append(button); row.append(action);
+    tbody.append(row);
+  });
+}
+
+function renderScanner(current) {
+  const scanner = current.scanner || {};
+  const cfg = current.config || {};
+  const total = numeric(scanner.total_symbols);
+  const scanned = numeric(scanner.scanned_symbols);
+  const all = (scanner.mode || cfg.universe_mode) === 'all';
+  text('universeBadge', all ? 'Tüm USDT pariteleri' : 'Seçili pariteler');
+  text('scannerCount', `${scanned ?? '—'} / ${total ?? '—'} parite`);
+  $('scanProgress').value = total > 0 && scanned !== null ? Math.min(100, Math.max(0, scanned / total * 100)) : 0;
+  const pending = scanner.pending_scans !== undefined ? ` · Bekleyen ${scanner.pending_scans}` : '';
+  text('scannerLast', `${scanner.last_symbol ? `Son taranan: ${scanner.last_symbol}` : 'Tarama verisi bekleniyor'}${pending}${scanner.last_scan_at ? ` · ${dateTime(scanner.last_scan_at)}` : ''}`);
+  const errors = Array.isArray(scanner.errors) ? scanner.errors.length : numeric(scanner.errors) || 0;
+  text('scannerErrors', `${scanner.batch_size ?? '—'} parite / grup · ${errors} tarama hatası${scanner.warning ? ` · ${scanner.warning}` : ''}`);
+  const markets = marketsOf(current);
+  text('marketSummaryCount', markets.length);
+  const key = JSON.stringify(markets);
+  if (key === marketSummaryKey) return;
+  marketSummaryKey = key;
+  const tbody = $('marketsBody'); tbody.replaceChildren();
+  if (!markets.length) { const row = document.createElement('tr'); const cell = addCell(row, 'Henüz taranan piyasa yok.', 'empty-cell'); cell.colSpan = 5; tbody.append(row); return; }
+  markets.forEach((market) => {
+    const row = document.createElement('tr');
+    addCell(row, market.symbol || '—'); addCell(row, price(market.price));
+    const signal = Object.prototype.hasOwnProperty.call(market, 'signal_details') && !market.signal_details ? null : market.last_signal;
+    addCell(row, { buy: 'Alış', sell: 'Satış', hold: 'Bekle' }[signal] || signal || 'Henüz taranmadı', signal === 'buy' ? 'positive' : signal === 'sell' ? 'negative' : '');
+    addCell(row, dateTime(market.updated_at));
+    const cell = addCell(row, market.error ? 'Hata' : numeric(market.price) === null ? 'Veri bekleniyor' : 'Kotasyon alındı', market.error ? 'negative' : '');
+    if (market.error) cell.title = market.error;
+    tbody.append(row);
+  });
 }
 
 function addCell(row, value, className) {
@@ -254,53 +521,144 @@ function renderBacktest(report) {
   });
   const notes = Array.isArray(report.notes) ? report.notes.join('\n') : report.notes || '';
   const period = results[0]?.test_start ? `Değerlendirme dönemi: ${dateTime(results[0].test_start)} – ${dateTime(results[0].test_end)} (İstanbul).` : '';
-  text('backtestNotes', `${report.train_candles ?? '—'} gözlem/ısınma mumu · ${report.test_candles ?? '—'} değerlendirme mumu. ${period}\n${notes}`.trim());
+  const identity = `Son test: ${report.symbol || state?.config?.symbol || '—'} · ${report.interval || state?.config?.interval || '—'} · ${report.is_synthetic ? 'SENTETİK DEMO' : 'Binance verisi'}. Tek parite sonucu; portföy simülasyonu değildir.`;
+  text('backtestNotes', `${identity}\n${report.train_candles ?? '—'} gözlem/ısınma mumu · ${report.test_candles ?? '—'} değerlendirme mumu. ${period}\n${notes}`.trim());
 }
 
 async function fetchState() {
   if (fetching) return;
   fetching = true;
-  try { render(await api('/api/state')); }
+  const version = emergencyVersion;
+  try { const current = await api('/api/state'); if (version === emergencyVersion) render(current); }
   catch (error) {
+    networkHealthy = false;
     $('connectionStatus').className = 'connection offline';
     $('connectionStatus').replaceChildren(document.createElement('i'), document.createTextNode('Bağlantı yok'));
     $('errorBanner').hidden = false;
     text('errorBanner', `Sunucuya bağlanılamadı: ${error.message} Gösterilen değerler güncel olmayabilir.`);
+    text('refreshStatus', 'Bağlantı yok · otomatik yeniden deneniyor');
+    $('refreshStatus').className = 'negative';
+    updateButtons();
   } finally { fetching = false; }
 }
 
-async function control(action) {
+async function control(action, symbol) {
   if (requestBusy) return;
   requestBusy = true; updateButtons();
+  const version = emergencyVersion;
   try {
-    await api('/api/control', { method: 'POST', body: JSON.stringify({ action }) });
-    if (action === 'reset') { configDirty = false; hasHydrated = false; chartPoints = []; }
+    const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ action, ...(symbol ? { symbol } : {}) }) });
+    if (action === 'reset') { configDirty = false; hasHydrated = false; chartPoints = []; fillsInitialized = false; seenEntries = new Set(); seenExits = new Set(); $('latestExecution').hidden = true; }
+    if (result.config && version === emergencyVersion) render(result);
     await fetchState();
-    toast({ start: 'Bot başlatıldı. Yalnızca deneme işlemleri yapılır.', pause: 'Yeni strateji işlemleri duraklatıldı. Açık pozisyonun stop takibi sürer.', close_position: 'Deneme pozisyonu kapatıldı.', reset: 'Deneme defteri sıfırlandı.' }[action]);
+    if (version === emergencyVersion) toast({ start: 'Bot başlatıldı. Yalnızca deneme işlemleri yapılır.', pause: 'Yeni strateji işlemleri duraklatıldı. Açık pozisyonların stop takibi sürer.', close_position: `${symbol || ''} deneme pozisyonu kapatıldı.`, close_all: 'Otomasyon duraklatıldı ve tüm deneme pozisyonları kapatıldı.', reset: 'Deneme defteri sıfırlandı.', clear_emergency: 'Acil kilit kaldırıldı. Bot duraklatılmış durumda; otomasyon için ayrıca Başlat seçin.' }[action]);
   } catch (error) { toast(error.message, true); }
   finally { requestBusy = false; updateButtons(); }
 }
 
-configForm.addEventListener('input', () => { configDirty = true; text('settingsState', 'Kaydedilmemiş değişiklikler'); updateCostEstimate(); updateButtons(); });
-configForm.addEventListener('change', () => { configDirty = true; text('settingsState', 'Kaydedilmemiş değişiklikler'); updateCostEstimate(); updateButtons(); });
+async function manualTrade(action) {
+  if (requestBusy || emergencyBusy || !state) return;
+  const context = manualContext();
+  if (!context.fresh) { toast('İşlem için seçili paritenin güncel fiyatı gerekli.', true); return; }
+  if (action === 'buy' && (!context.known || $('manualBuyButton').disabled || !$('manualTradeForm').reportValidity())) return;
+  if (action === 'sell' && !context.position) { toast('Seçili paritede satılacak açık pozisyon yok.', true); return; }
+  const body = { action, symbol: context.symbol };
+  if (action === 'buy') body.amount = $('manualAmount').value;
+  const version = emergencyVersion;
+  const notificationVersion = fillNotificationVersion;
+  requestBusy = true; updateButtons();
+  try {
+    const result = await api('/api/control', { method: 'POST', body: JSON.stringify(body) });
+    if (result.config && version === emergencyVersion) render(result);
+    await fetchState();
+    if (version === emergencyVersion && notificationVersion === fillNotificationVersion) toast(`${context.symbol} manuel ${action === 'buy' ? 'alış' : 'satış'} işlemi uygulandı (deneme).`);
+  } catch (error) { toast(error.message, true); }
+  finally { requestBusy = false; updateButtons(); }
+}
+
+async function emergencyClose() {
+  if (emergencyBusy) return;
+  if (!window.confirm('ACİL DURDURMA\n\nBot durdurulacak ve yeni alışlar kalıcı olarak kilitlenecek. Güncel fiyatı olan tüm deneme pozisyonları kapatılacak; fiyatı eksik olanlar veri akışı geldiğinde kapatılmak üzere bekleyecek.\n\nDevam edilsin mi?')) return;
+  emergencyBusy = true;
+  emergencyVersion += 1;
+  updateButtons();
+  text('emergencyButton', 'ACİL DURDURMA UYGULANIYOR…');
+  try {
+    const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ action: 'emergency_close' }) });
+    emergencyVersion += 1;
+    if (result.config) render(result);
+    await fetchState();
+    const emergency = state?.emergency || result.emergency || {};
+    const pending = Array.isArray(emergency.pending_symbols) ? emergency.pending_symbols.length : 0;
+    toast(pending ? `Acil kilit etkin. ${pending} pozisyon güncel fiyatla kapatılmayı bekliyor.` : positionsOf().length ? 'Acil kilit etkin. Açık pozisyonların kapatma durumu izleniyor.' : 'Acil kilit etkin. Tüm deneme pozisyonları kapalı; bot durduruldu.');
+  } catch (error) {
+    emergencyVersion += 1;
+    toast(`Acil durum isteğinin sonucu doğrulanamadı: ${error.message} Panel durumu yeniden sorgulanıyor.`, true);
+    await fetchState();
+  } finally {
+    emergencyBusy = false;
+    text('emergencyButton', 'ACİL DURDUR / TÜMÜNÜ KAPAT');
+    updateButtons();
+  }
+}
+
+function configChanged(event) {
+  if (event.target.matches('[data-local-control]')) return;
+  markConfigDirty();
+  if (event.target.name === 'universe_mode') renderUniversePicker();
+}
+configForm.addEventListener('input', configChanged);
+configForm.addEventListener('change', configChanged);
 configForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (requestBusy || !configForm.reportValidity()) return;
   const payload = {};
-  for (const [name, value] of new FormData(configForm)) payload[name] = ['symbol', 'interval', 'strategy', 'data_source', 'trailing_mode'].includes(name) ? String(value) : Number(value);
-  payload.symbol = payload.symbol.trim().toUpperCase();
+  for (const [name, value] of new FormData(configForm)) payload[name] = ['interval', 'strategy', 'data_source', 'trailing_mode', 'universe_mode'].includes(name) ? String(value) : Number(value);
+  payload.symbols = [...selectedSymbols].sort();
+  if (payload.universe_mode === 'selected' && payload.symbols.length === 0) { toast('İzlemek için en az bir parite seçin.', true); return; }
   requestBusy = true; updateButtons(); text('settingsState', 'Kaydediliyor…');
+  const version = emergencyVersion;
   try {
-    await api('/api/config', { method: 'PATCH', body: JSON.stringify(payload) });
+    const result = await api('/api/config', { method: 'PATCH', body: JSON.stringify(payload) });
     configDirty = false; hasHydrated = false;
+    if (result.config && version === emergencyVersion) render(result);
     await fetchState();
-    toast('Ayarlar kaydedildi.');
+    if (version === emergencyVersion) toast('Ayarlar kaydedildi.');
   } catch (error) { toast(error.message, true); text('settingsState', 'Kaydedilemedi · değişiklikler korunuyor'); }
   finally { requestBusy = false; updateButtons(); }
 });
 $('startButton').addEventListener('click', () => control('start'));
 $('pauseButton').addEventListener('click', () => control('pause'));
-$('closeButton').addEventListener('click', () => control('close_position'));
+$('manualTradeForm').addEventListener('submit', (event) => { event.preventDefault(); manualTrade('buy'); });
+$('manualSellButton').addEventListener('click', () => manualTrade('sell'));
+$('manualSymbol').addEventListener('input', () => { manualSymbolTouched = true; $('manualSymbol').setCustomValidity(''); updateManualControls(); });
+$('manualSymbol').addEventListener('change', updateManualControls);
+$('manualAmount').addEventListener('input', () => { manualAmountTouched = true; updateManualControls(); });
+$('emergencyButton').addEventListener('click', emergencyClose);
+$('clearEmergencyButton').addEventListener('click', () => control('clear_emergency'));
+$('closeButton').addEventListener('click', () => control(Array.isArray(state?.positions) ? 'close_all' : 'close_position', Array.isArray(state?.positions) ? undefined : state?.config?.symbol));
+$('refreshSymbolsButton').addEventListener('click', () => loadSymbols(true));
+$('symbolSearch').addEventListener('input', renderUniversePicker);
+$('clearSelectionButton').addEventListener('click', () => { selectedSymbols.clear(); markConfigDirty(); renderUniversePicker(); });
+$('focusSymbol').addEventListener('input', () => { focusDirty = true; $('focusSymbol').setCustomValidity(''); });
+$('focusForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (requestBusy || !state) return;
+  const symbol = $('focusSymbol').value.trim().toUpperCase();
+  if (catalogue.length && !catalogue.some((entry) => entry.symbol === symbol)) {
+    $('focusSymbol').setCustomValidity('Geçerli veri kaynağının listesinden bir USDT paritesi seçin.');
+    $('focusSymbol').reportValidity(); return;
+  }
+  requestBusy = true; updateButtons();
+  const version = emergencyVersion;
+  try {
+    const result = await api('/api/config', { method: 'PATCH', body: JSON.stringify({ symbol }) });
+    if (version === emergencyVersion) { focusDirty = false; if (result.config) render(result); }
+    await fetchState();
+    if (version === emergencyVersion) toast(`${symbol} grafik ve tek parite testi için seçildi. Tarama evreni değişmedi.`);
+  } catch (error) { toast(error.message, true); }
+  finally { requestBusy = false; updateButtons(); }
+});
 $('resetButton').addEventListener('click', () => { $('resetDialog').returnValue = ''; $('resetDialog').showModal(); });
 $('resetDialog').addEventListener('cancel', () => { $('resetDialog').returnValue = 'cancel'; });
 $('resetDialog').addEventListener('close', () => { if ($('resetDialog').returnValue === 'confirm') control('reset'); });
@@ -319,6 +677,7 @@ $('backtestForm').addEventListener('submit', async (event) => {
   finally { backtestBusy = false; text('backtestButton', 'Geçmiş testi çalıştır'); updateButtons(); }
 });
 document.querySelectorAll('nav a').forEach((link) => link.addEventListener('click', () => { document.querySelectorAll('nav a').forEach((item) => item.classList.remove('active')); link.classList.add('active'); }));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') fetchState(); });
 updateButtons();
 fetchState();
 setInterval(fetchState, 3000);

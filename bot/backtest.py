@@ -158,6 +158,7 @@ def _run(candles, config, strategy):
     return {
         "strategy": strategy,
         "strategy_name": STRATEGIES[strategy]["name"],
+        "strategy_description": STRATEGIES[strategy]["description"],
         "net_pnl": _string(pnl),
         "net_return_pct": _string(pnl / initial_cash * 100),
         "max_drawdown_pct": _string(max_drawdown),
@@ -175,7 +176,7 @@ def _run(candles, config, strategy):
         "events": events,
         "equity_curve": curve,
         **_metadata(candles, split),
-        "notes": list(NOTES),
+        "notes": list(NOTES) + (["Karma strateji: " + STRATEGIES[strategy]["description"]] if strategy == "hybrid" else []),
     }
 
 
@@ -185,11 +186,11 @@ def run_backtest(candles, config, strategy="ema_cross"):
 
 
 def compare_strategies(candles, config):
-    """Compare the three candidates on identical candles, capital and costs."""
+    """Compare all four candidates on identical candles, capital and costs."""
     candles = _validated(candles)
     return {
         "results": [_run(candles, config, strategy) for strategy in STRATEGIES],
         **_metadata(candles, _split(candles)),
         "fee_assumption": _fee_assumption(config),
-        "notes": list(NOTES),
+        "notes": list(NOTES) + ["Karma strateji: " + STRATEGIES["hybrid"]["description"]],
     }
