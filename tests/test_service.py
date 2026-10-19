@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from bot.service import BotService, Store, CHART_CACHE_SIZE, CHART_CACHE_TTL
+from bot.service import BotService, Store, CHART_CACHE_SIZE, CHART_CACHE_TTL, TREND_POINTS
 from bot.market import DemoMarket
 from bot.core import DEFAULT_CONFIG, PaperBroker
 from app import Handler
@@ -447,6 +447,105 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(symbol=symbol,interval=interval), self.assertRaises(ValueError):
                 self.service.chart(symbol,interval)
 
+    def test_second_chart_preserves_actual_live_candle_and_trading_interval(self):
+        self.settle()
+        before=self.service.portfolio.export_state()
+        self.feed.chart_candles=lambda symbol,interval,limit:dict(candles=self.feed.candles(symbol,interval,limit),
+            live_candle=dict(open_time='2026-01-01T01:40:00+00:00',close_time='2026-01-01T01:40:00.999+00:00',
+                             open='100',high='102',low='99',close='101',volume='8'))
+        chart=self.service.chart('BTCUSDT','1s')
+        self.assertEqual(1,chart['interval_seconds'])
+        self.assertEqual('102',chart['live_candle']['high'])
+        chart['live_candle']['high']='CORRUPTED'
+        self.assertEqual('102',self.service.chart('BTCUSDT','1s')['live_candle']['high'])
+        self.assertEqual('5m',self.service.config['interval'])
+        with self.assertRaises(ValueError):
+            self.service.configure(dict(interval='1s'))
+        self.assertEqual(before,self.service.portfolio.export_state())
+
+    def test_second_chart_refreshes_after_a_second_instead_of_thirty_seconds(self):
+        self.settle()
+        with patch.object(self.feed,'candles',wraps=self.feed.candles) as candles:
+            first=self.service.chart('ETHUSDT','1s')
+            self.assertFalse(first['cached'])
+            self.assertTrue(self.service.chart('ETHUSDT','1s')['cached'])
+            self.service._chart_cache[('ETHUSDT','1s')]['fetched']-=1
+            self.assertFalse(self.service.chart('ETHUSDT','1s')['cached'])
+            self.assertEqual(2,candles.call_count)
+
+    def test_trend_previews_collect_actual_prices_for_all_catalog_without_extra_io(self):
+        self.service.step()
+        first=self.service.trends(['ETHUSDT'])['trends'][0]
+        self.assertEqual('collecting',first['basis'])
+        self.assertEqual(1,len(first['points']))
+        self.assertIsNone(first['change_pct'])
+        self.feed.price='110'
+        self.service.step()
+        before=self.service.portfolio.export_state()
+        with patch.object(self.feed,'prices') as prices,patch.object(self.feed,'candles') as candles:
+            result=self.service.trends(['ETHUSDT','币安人生USDT'])
+            prices.assert_not_called()
+            candles.assert_not_called()
+        for trend in result['trends']:
+            self.assertEqual(['100','110'],[point['price'] for point in trend['points']])
+            self.assertAlmostEqual(10,trend['change_pct'])
+            self.assertEqual('up',trend['direction'])
+            self.assertEqual('quote_observations',trend['basis'])
+            self.assertFalse(trend['stale'])
+        self.assertEqual('demo',result['source'])
+        self.assertTrue(result['is_synthetic'])
+        self.assertEqual(before,self.service.portfolio.export_state())
+        self.assertEqual(3,len(self.service.trends()['trends']))
+
+    def test_trends_start_empty_and_never_fabricate_prices_from_single_observation(self):
+        self.service.symbols()
+        result=self.service.trends(['ETHUSDT'])['trends'][0]
+        self.assertEqual([],result['points'])
+        self.assertEqual('collecting',result['basis'])
+        self.assertEqual('unknown',result['direction'])
+        self.assertIsNone(result['change_pct'])
+        self.assertTrue(result['stale'])
+
+    def test_trends_bound_observations_and_return_defensive_copies(self):
+        self.service.step()
+        with self.service.lock:
+            for index in range(TREND_POINTS+8):
+                self.service._remember_trends({'ETHUSDT':str(100+index)},f'2026-01-01T00:00:{index:02d}+00:00')
+        result=self.service.trends(['ETHUSDT'])['trends'][0]
+        self.assertEqual(TREND_POINTS,len(result['points']))
+        self.assertEqual('108',result['points'][0]['price'])
+        result['points'][0]['price']='CORRUPTED'
+        self.assertEqual('108',self.service.trends(['ETHUSDT'])['trends'][0]['points'][0]['price'])
+
+    def test_trends_use_only_real_closed_history_during_initial_warmup(self):
+        self.service.symbols()
+        self.service.chart('ETHUSDT','5m')
+        self.service._chart_cache[('ETHUSDT','5m')]['fetched']-=10
+        trend=self.service.trends(['ETHUSDT'])['trends'][0]
+        self.assertEqual('closed_candles',trend['basis'])
+        self.assertEqual('5m',trend['interval'])
+        self.assertEqual(300,trend['sampling_seconds'])
+        self.assertEqual(TREND_POINTS,len(trend['points']))
+        self.assertEqual('100',trend['points'][-1]['price'])
+        self.assertEqual('down',trend['direction'])
+        self.assertFalse(trend['stale'])
+
+    def test_stale_quotes_are_explicit_and_source_change_discards_trends(self):
+        self.settle()
+        self.assertTrue(self.service._trend_history)
+        self.feed.fail=True
+        self.service.step()
+        self.assertTrue(self.service.trends(['ETHUSDT'])['trends'][0]['stale'])
+        self.service.configure(dict(data_source='binance'))
+        self.assertEqual({},self.service._trend_history)
+        self.assertEqual([],self.service.trends()['trends'])
+
+    def test_trends_reject_invalid_unknown_and_excessive_symbol_lists(self):
+        self.service.symbols()
+        for symbols in ('BTCUSDT',['BAD/USDT'],['UNKNOWNUSDT'],['BTCUSDT']*51):
+            with self.subTest(symbols=symbols),self.assertRaises(ValueError):
+                self.service.trends(symbols)
+
     def test_legacy_database_migrates_and_is_backed_up(self):
         config={**DEFAULT_CONFIG,'symbol':'BTCUSDT','interval':'5m','strategy':'ema_cross','data_source':'demo'}
         broker=PaperBroker(config)
@@ -541,6 +640,17 @@ class HttpTests(unittest.TestCase):
                     chart=json.load(result)
                     self.assertEqual('ETHUSDT',chart['symbol'])
                     self.assertEqual(100,len(chart['candles']))
+                    self.assertIsNone(chart['live_candle'])
+                    self.assertEqual(300,chart['interval_seconds'])
+                with urlopen(base+'/api/chart?symbol=ETHUSDT&interval=1s') as result:
+                    self.assertEqual(1,json.load(result)['interval_seconds'])
+                with urlopen(base+'/api/trends?symbols=ETHUSDT,BTCUSDT') as result:
+                    trends=json.load(result)
+                    self.assertEqual(['ETHUSDT','BTCUSDT'],[row['symbol'] for row in trends['trends']])
+                    self.assertEqual('closed_candles',trends['trends'][0]['basis'])
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(base+'/api/trends?symbols=INVALID')
+                self.assertEqual(400,caught.exception.code)
                 with self.assertRaises(HTTPError) as caught:
                     urlopen(base+'/api/chart?symbol=INVALID&interval=5m')
                 self.assertEqual(400,caught.exception.code)

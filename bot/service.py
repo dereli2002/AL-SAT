@@ -1,6 +1,6 @@
 """Persistent multi-asset paper portfolio and rate-aware Spot scanner."""
 from concurrent.futures import ThreadPoolExecutor
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,7 +12,7 @@ import time
 
 from .core import DEFAULT_CONFIG, normalize_config
 from .portfolio import PaperPortfolio
-from .market import BinanceMarket, DemoMarket, INTERVALS, valid_market
+from .market import BinanceMarket, DemoMarket, INTERVALS, CHART_INTERVALS, valid_market, valid_chart
 from .strategies import STRATEGIES, signals, signal_details
 from .backtest import compare_strategies, run_backtest
 
@@ -22,6 +22,9 @@ APP_DEFAULTS = dict(symbol='BTCUSDT', symbols=['BTCUSDT','ETHUSDT','SOLUSDT'],
 SCAN_BATCH_SIZE = 12
 CHART_CACHE_SIZE = 64
 CHART_CACHE_TTL = 30
+CHART_REFRESH_TTLS = {'1s': .8, '1m': 2, '5m': 3, '15m': 5, '1h': 5}
+TREND_POINTS = 40
+TREND_SYMBOL_LIMIT = 2000
 
 
 def validated_config(config):
@@ -101,6 +104,7 @@ class BotService:
         self._pending={}
         self._cache={}
         self._chart_cache=OrderedDict()
+        self._trend_history={}
         self._next_due={}
         self._cursor=0
         self._catalog=[]
@@ -174,10 +178,10 @@ class BotService:
                 self.error='Borsa istek sınırı: yeni istekler ve alımlar bekliyor.'
                 self.market['error']=self.error
 
-    def _remember_chart(self,symbol,interval,bars):
+    def _remember_chart(self,symbol,interval,bars,live_candle=None):
         """Called with the service lock; chart reads never alter trade signals."""
         key=(symbol,interval)
-        self._chart_cache[key]=dict(candles=deepcopy(bars),fetched=time.monotonic(),
+        self._chart_cache[key]=dict(candles=deepcopy(bars),live_candle=deepcopy(live_candle),fetched=time.monotonic(),
                                     updated_at=datetime.now(timezone.utc).isoformat())
         self._chart_cache.move_to_end(key)
         while len(self._chart_cache)>CHART_CACHE_SIZE:
@@ -188,12 +192,14 @@ class BotService:
                      and time.monotonic()-self._last_success<30
                      and time.monotonic()>=self._backoff_until
                      and symbol in self._prices)
-        stale=bool(error) or time.monotonic()-entry['fetched']>=CHART_CACHE_TTL
+        stale=bool(error) or time.monotonic()-entry['fetched']>=CHART_REFRESH_TTLS[interval]
         if not self.feed.is_synthetic and entry['candles']:
             close=datetime.fromisoformat(entry['candles'][-1]['close_time'].replace('Z','+00:00'))
-            stale=stale or (datetime.now(timezone.utc)-close).total_seconds()>INTERVALS[interval]*2+60
+            grace=2 if interval=='1s' else 10
+            stale=stale or (datetime.now(timezone.utc)-close).total_seconds()>max(5,CHART_INTERVALS[interval]*2+grace)
         return dict(symbol=symbol,interval=interval,source=self.feed.source,is_synthetic=self.feed.is_synthetic,
-                    candles=deepcopy(entry['candles']),price=self._prices.get(symbol),
+                    candles=deepcopy(entry['candles']),live_candle=deepcopy(entry.get('live_candle')),
+                    interval_seconds=CHART_INTERVALS[interval],price=self._prices.get(symbol),
                     quote_time=self._quote_time,quote_fresh=quote_fresh,
                     updated_at=entry['updated_at'],cached=cached,history_stale=stale,error=error)
 
@@ -207,7 +213,7 @@ class BotService:
         with self.lock:
             symbol=symbol or self.config['symbol']
             interval=interval or self.config['interval']
-            valid_market(symbol,interval)
+            valid_chart(symbol,interval)
             available={item['symbol'] for item in self._catalog}|set(self.portfolio.position_symbols)
             if available and symbol not in available:
                 raise ValueError('Seçilen sembol aktif USDT Spot listesinde veya açık pozisyonlarda yok.')
@@ -218,13 +224,14 @@ class BotService:
                     return self._chart_payload(symbol,interval,entry,cached=True,
                                                error='Borsa istek sınırı nedeniyle grafik yenilemesi bekliyor.')
                 raise ValueError('Borsa istek sınırı beklenirken grafik isteği gönderilemez.')
-            if entry and time.monotonic()-entry['fetched']<CHART_CACHE_TTL:
+            if entry and time.monotonic()-entry['fetched']<CHART_REFRESH_TTLS[interval]:
                 self._chart_cache.move_to_end(key)
                 return self._chart_payload(symbol,interval,entry,cached=True)
             generation,feed=self._generation,self.feed
         try:
-            bars=feed.candles(symbol,interval,100)
-            if not bars:
+            display=feed.chart_candles(symbol,interval,100) if hasattr(feed,'chart_candles') else dict(candles=feed.candles(symbol,interval,100),live_candle=None)
+            bars,live=display['candles'],display.get('live_candle')
+            if not bars and not live:
                 raise ValueError('Grafik için geçmiş mum verisi bulunamadı.')
         except Exception as exc:
             self._record_throttle(exc)
@@ -238,8 +245,71 @@ class BotService:
         with self.lock:
             if generation!=self._generation:
                 raise ValueError('Grafik yüklenirken ayarlar değişti; yeniden deneyin.')
-            self._remember_chart(symbol,interval,bars)
+            self._remember_chart(symbol,interval,bars,live)
             return self._chart_payload(symbol,interval,self._chart_cache[key],cached=False)
+
+    def _remember_trends(self,prices,updated_at):
+        """Retain actual batch observations, never invented OHLC or deltas."""
+        keep=set(sorted({row['symbol'] for row in self._catalog}|set(self.portfolio.position_symbols))[:TREND_SYMBOL_LIMIT])
+        for symbol in list(self._trend_history):
+            if symbol not in keep:
+                del self._trend_history[symbol]
+        for symbol,price in prices.items():
+            if symbol not in keep:
+                continue
+            points=self._trend_history.setdefault(symbol,deque(maxlen=TREND_POINTS))
+            point=dict(time=updated_at,price=price)
+            if points and points[-1]['time']==updated_at:
+                points[-1]=point
+            else:
+                points.append(point)
+
+    def trends(self,symbols=None):
+        """Read bounded previews without any exchange request or trade change."""
+        with self.lock:
+            available={row['symbol'] for row in self._catalog}|set(self.portfolio.position_symbols)
+            if symbols is None:
+                selected=sorted(available)[:TREND_SYMBOL_LIMIT]
+            else:
+                if not isinstance(symbols,list) or len(symbols)>50:
+                    raise ValueError('Trend önizlemesi için en çok 50 parite seçin.')
+                for symbol in symbols:
+                    valid_market(symbol,'1m')
+                    if symbol not in available:
+                        raise ValueError('Trend sembolü aktif listede veya açık pozisyonlarda yok.')
+                selected=list(dict.fromkeys(symbols))
+            fresh=(not self.market['error'] and self._last_success is not None
+                   and time.monotonic()-self._last_success<30
+                   and time.monotonic()>=self._backoff_until)
+            output=[]
+            for symbol in selected:
+                points=list(self._trend_history.get(symbol,()))
+                basis,interval,sampling='quote_observations',None,5
+                stale=not fresh or symbol not in self._prices
+                if len(points)<2:
+                    entries=[(key,entry) for key,entry in self._chart_cache.items()
+                             if key[0]==symbol and len(entry['candles'])>=2]
+                    if entries:
+                        (unused,interval),entry=max(entries,key=lambda item:item[1]['fetched'])
+                        points=[dict(time=bar['close_time'],price=bar['close']) for bar in entry['candles'][-TREND_POINTS:]]
+                        basis,sampling='closed_candles',CHART_INTERVALS[interval]
+                        stale=bool(self.market['error']) or time.monotonic()-entry['fetched']>max(60,sampling*2)
+                        if not self.feed.is_synthetic:
+                            close=datetime.fromisoformat(points[-1]['time'].replace('Z','+00:00'))
+                            stale=stale or (datetime.now(timezone.utc)-close).total_seconds()>sampling*2+60
+                    else:
+                        basis='collecting'
+                change=None
+                direction='unknown'
+                if len(points)>=2:
+                    first,last=Decimal(points[0]['price']),Decimal(points[-1]['price'])
+                    change=float((last/first-1)*100) if first>0 else None
+                    direction='up' if last>first else 'down' if last<first else 'flat'
+                output.append(dict(symbol=symbol,points=deepcopy(points),basis=basis,interval=interval,
+                                   sampling_seconds=sampling,change_pct=change,direction=direction,stale=stale,
+                                   updated_at=points[-1]['time'] if points else None))
+            return dict(source=self.feed.source,is_synthetic=self.feed.is_synthetic,
+                        updated_at=self._quote_time,trends=output)
 
     @staticmethod
     def _scan(feed,symbol,interval):
@@ -371,6 +441,7 @@ class BotService:
                         events+=self.portfolio.tick(prices,instant,signals=new_signals,filters=filters)
                 self._prices=prices
                 self._quote_time=quote['updated_at']
+                self._remember_trends(prices,self._quote_time)
                 self.market=dict(source=feed.source,is_synthetic=feed.is_synthetic,symbol=self.config['symbol'],
                                  price=prices.get(self.config['symbol']),updated_at=quote['updated_at'],error=None)
                 self.error=None if time.monotonic()>=self._backoff_until else 'Borsa istek sınırı: yeni istekler ve alımlar bekliyor.'
@@ -444,6 +515,7 @@ class BotService:
             self._pending.clear()
             self._cache.clear()
             self._chart_cache.clear()
+            self._trend_history.clear()
             self._next_due.clear()
             self.last_candles={}
             self._cursor=0

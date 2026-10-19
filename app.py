@@ -36,6 +36,13 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(self.service.state())
         elif path=='/api/symbols':
             self.respond(self.service.symbols())
+        elif path=='/api/trends':
+            try:
+                query=parse_qs(urlparse(self.path).query)
+                symbols=query.get('symbols',[None])[0]
+                self.respond(self.service.trends(symbols.split(',') if symbols else None))
+            except (ValueError,TypeError,KeyError,ArithmeticError) as exc:
+                self.respond({'error':str(exc)},400)
         elif path=='/api/chart':
             try:
                 query=parse_qs(urlparse(self.path).query)
@@ -51,6 +58,7 @@ class Handler(SimpleHTTPRequestHandler):
         elif path.startswith('/api/'):
             self.respond({'error':'Bulunamadı.'},404)
         elif path in ('/','/index.html','/app.js','/style.css',
+                      '/asset-picker.js','/asset-picker.css','/market-chart.js','/market-chart.css',
                       '/positions.html','/positions.js','/positions.css'):
             super().do_GET()
         else:

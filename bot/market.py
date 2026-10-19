@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 BASE_URL = 'https://data-api.binance.vision'
 INTERVALS = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600}
+CHART_INTERVALS = {'1s': 1, **INTERVALS}
 METADATA_TTL = 600
 
 
@@ -31,6 +32,13 @@ def valid_market(symbol, interval):
         raise ValueError('İşlem çifti USDT ile biten bir Binance Spot sembolü olmalı.')
     if not isinstance(interval, str) or interval not in INTERVALS:
         raise ValueError('Mum aralığı 1m, 5m, 15m veya 1h olmalı.')
+
+
+def valid_chart(symbol, interval):
+    # Display-only second candles must never become an automation timeframe.
+    valid_market(symbol, '1m')
+    if not isinstance(interval, str) or interval not in CHART_INTERVALS:
+        raise ValueError('Grafik aralığı 1s, 1m, 5m, 15m veya 1h olmalı.')
 
 
 class MarketRateLimitError(RuntimeError):
@@ -223,17 +231,36 @@ class BinanceMarket:
         return dict(prices=prices, updated_at=iso(datetime.now(timezone.utc)),
                     missing_symbols=sorted(selected - prices.keys()))
 
-    def candles(self, symbol, interval, limit=500):
-        valid_market(symbol, interval)
+    def chart_candles(self, symbol, interval, limit=100):
+        """Actual exchange OHLC, with the unfinished candle kept separate.
+
+        Strategy and backtest callers use candles(), which cannot consume this
+        candle before its close time and do not accept the display-only 1s.
+        """
+        valid_chart(symbol, interval)
         if not 100 <= limit <= 1000:
             raise ValueError('Mum sayısı 100–1000 arasında olmalı.')
         raw = self._get('/api/v3/klines', {'symbol': symbol, 'interval': interval, 'limit': limit})
+        if not isinstance(raw, list):
+            raise ValueError('Borsa mum yanıtı geçersiz.')
         now_ms = datetime.now(timezone.utc).timestamp() * 1000
-        return [dict(open_time=iso(datetime.fromtimestamp(row[0]/1000, timezone.utc)),
-                     close_time=iso(datetime.fromtimestamp(row[6]/1000, timezone.utc)),
-                     open=str(row[1]), high=str(row[2]), low=str(row[3]),
-                     close=str(row[4]), volume=str(row[5]))
-                for row in raw if row[6] < now_ms]
+        closed, current = [], None
+        for row in raw:
+            if not isinstance(row, list) or len(row) < 7:
+                raise ValueError('Borsa mum satırı geçersiz.')
+            candle = dict(open_time=iso(datetime.fromtimestamp(row[0]/1000, timezone.utc)),
+                          close_time=iso(datetime.fromtimestamp(row[6]/1000, timezone.utc)),
+                          open=str(row[1]), high=str(row[2]), low=str(row[3]),
+                          close=str(row[4]), volume=str(row[5]))
+            if row[6] < now_ms:
+                closed.append(candle)
+            elif row[0] <= now_ms:
+                current = candle
+        return dict(candles=closed, live_candle=current)
+
+    def candles(self, symbol, interval, limit=500):
+        valid_market(symbol, interval)
+        return self.chart_candles(symbol, interval, limit)['candles']
 
     def filters(self, symbol):
         valid_market(symbol, '1m')
@@ -301,12 +328,12 @@ class DemoMarket:
         return dict(step_size='0.00000001', min_qty='0.00000001', min_notional='5',
                     max_qty='0', max_notional='0')
 
-    def candles(self, symbol, interval, limit=500):
-        valid_market(symbol, interval)
+    def _display_candles(self, symbol, interval, limit=500):
+        valid_chart(symbol, interval)
         if not 100 <= limit <= 1000:
             raise ValueError('Mum sayısı 100–1000 arasında olmalı.')
         _selected_symbols([symbol], {pair['symbol'] for pair in self.symbols()})
-        duration = INTERVALS[interval]
+        duration = CHART_INTERVALS[interval]
         output = []
         with self._lock:
             step, anchor = self.step, self.anchor
@@ -318,6 +345,13 @@ class DemoMarket:
                                open=f'{opened:.8f}', high=f'{max(opened,closed)*1.002:.8f}',
                                low=f'{min(opened,closed)*.998:.8f}', close=f'{closed:.8f}', volume='100'))
         return output
+
+    def candles(self, symbol, interval, limit=500):
+        valid_market(symbol, interval)
+        return self._display_candles(symbol, interval, limit)
+
+    def chart_candles(self, symbol, interval, limit=100):
+        return dict(candles=self._display_candles(symbol, interval, limit), live_candle=None)
 
     def sample(self, symbol, interval):
         valid_market(symbol, interval)

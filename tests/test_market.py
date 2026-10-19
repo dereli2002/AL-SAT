@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from bot.market import BinanceMarket, DemoMarket, MarketRateLimitError, valid_market
+from bot.market import BinanceMarket, DemoMarket, MarketRateLimitError, valid_market, valid_chart
 
 
 def pair(symbol='BTCUSDT', *, status='TRADING', spot=True, quote='USDT', filters=None):
@@ -385,6 +385,62 @@ class DemoMarketTests(unittest.TestCase):
         self.assertEqual(500, len(result['candles']))
         self.assertTrue(market.is_synthetic)
         self.assertEqual('demo', market.source)
+
+
+class DisplayCandleTests(unittest.TestCase):
+    def test_second_interval_is_display_only(self):
+        valid_chart('BTCUSDT', '1s')
+        with self.assertRaises(ValueError):
+            valid_market('BTCUSDT', '1s')
+        with self.assertRaises(ValueError):
+            BinanceMarket().candles('BTCUSDT', '1s', 100)
+        with self.assertRaises(ValueError):
+            DemoMarket().candles('BTCUSDT', '1s', 100)
+        for interval in ('0s', '2s', '1d', None):
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                valid_chart('BTCUSDT', interval)
+
+    def test_actual_ohlc_preserved_and_unfinished_candle_never_enters_closed_series(self):
+        instant=datetime(2026, 1, 1, 12, 0, 0, 500000, tzinfo=timezone.utc)
+        epoch=int(instant.timestamp()*1000)
+        rows=[[epoch-1500, '100', '104', '99', '102', '17', epoch-501],
+              [epoch-500, '102', '106', '101', '105', '21', epoch+499],
+              [epoch+500, '105', '110', '104', '109', '3', epoch+1499]]
+        market=BinanceMarket()
+        with patch.object(market,'_get',return_value=rows) as request:
+            with patch('bot.market.datetime') as clock:
+                clock.now.return_value=instant
+                clock.fromtimestamp.side_effect=datetime.fromtimestamp
+                result=market.chart_candles('BTCUSDT','1s',100)
+        request.assert_called_once_with('/api/v3/klines',dict(symbol='BTCUSDT',interval='1s',limit=100))
+        self.assertEqual(1,len(result['candles']))
+        self.assertEqual('102',result['candles'][0]['close'])
+        self.assertEqual(dict(open='102',high='106',low='101',close='105',volume='21'),
+                         {key:result['live_candle'][key] for key in ('open','high','low','close','volume')})
+        self.assertNotIn('109',[row['close'] for row in result['candles']])
+
+    def test_strategy_candles_stay_closed_even_though_chart_includes_forming_candle(self):
+        instant=datetime(2026,1,1,tzinfo=timezone.utc)
+        epoch=int(instant.timestamp()*1000)
+        rows=[[epoch-60000,'1','3','.5','2','10',epoch-1],
+              [epoch,'2','5','1','4','11',epoch+59999]]
+        market=BinanceMarket()
+        with patch.object(market,'_get',return_value=rows),patch('bot.market.datetime') as clock:
+            clock.now.return_value=instant
+            clock.fromtimestamp.side_effect=datetime.fromtimestamp
+            self.assertEqual(['2'],[row['close'] for row in market.candles('BTCUSDT','1m',100)])
+            self.assertEqual('4',market.chart_candles('BTCUSDT','1m',100)['live_candle']['close'])
+
+    def test_demo_second_chart_is_explicitly_synthetic_and_repeatable(self):
+        market=DemoMarket()
+        first=market.chart_candles('ETHUSDT','1s',100)
+        self.assertEqual(first,market.chart_candles('ETHUSDT','1s',100))
+        self.assertIsNone(first['live_candle'])
+        self.assertEqual(100,len(first['candles']))
+        beginning=datetime.fromisoformat(first['candles'][0]['open_time'])
+        next_time=datetime.fromisoformat(first['candles'][1]['open_time'])
+        self.assertEqual(1,(next_time-beginning).total_seconds())
+        self.assertTrue(market.is_synthetic)
 
 
 if __name__ == '__main__':

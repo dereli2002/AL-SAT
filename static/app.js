@@ -20,8 +20,6 @@ let requestBusy = false;
 let backtestBusy = false;
 let fetching = false;
 let toastTimer;
-let chartKey = '';
-let chartPoints = [];
 let catalogue = [];
 let selectedSymbols = new Set();
 let symbolsLoading = false;
@@ -44,12 +42,11 @@ let chartFocusSymbol = '';
 let chartFocusSource = '';
 let focusSaving = false;
 let focusToSave = null;
-let chartPickerKey = '';
-let chartPickerIndex = 0;
 let catalogueError = '';
-const chartHistories = new Map();
-const chartSessions = new Map();
-const chartRequests = new Set();
+let chartPicker = null;
+let manualPicker = null;
+let mainCandleChart = null;
+let displayInterval = null;
 
 function focusedSymbol(current = state) { return chartFocusSymbol || current?.config?.symbol || ''; }
 
@@ -121,6 +118,7 @@ function updateManualControls() {
   text('manualCash', `Kullanılabilir bakiye: ${money(cash)} USDT`);
   text('manualAvailability', buyIssue || 'AL ve SAT kontrolü sizde. Emirler bu deneme hesabında uygulanır.');
   text('manualPositionInfo', context.position ? `SAT: ${formatQuantity.format(numeric(context.position.quantity) || 0)} ${context.symbol.replace(/USDT$/, '')} miktarının tamamını kapatır.` : 'SAT, seçili paritenin açık miktarının tamamını kapatır.');
+  manualPicker?.update(pickerContext(context.symbol));
 }
 
 function renderEmergency(current) {
@@ -227,69 +225,20 @@ function renderUniversePicker() {
   $('selectedChips').replaceChildren(chips);
 }
 
-function chartPickerOptions() { return [...$('chartAssetList').querySelectorAll('[role="option"]')]; }
-
-function highlightChartOption(index, scroll = false) {
-  const options = chartPickerOptions();
-  chartPickerIndex = Math.max(0, Math.min(index, options.length - 1));
-  options.forEach((option, i) => option.classList.toggle('is-highlighted', i === chartPickerIndex));
-  const active = options[chartPickerIndex];
-  if (active) {
-    $('chartAssetSearch').setAttribute('aria-activedescendant', active.id);
-    if (scroll) active.scrollIntoView({ block: 'nearest' });
-  } else $('chartAssetSearch').removeAttribute('aria-activedescendant');
+function pickerContext(selectedSymbol) {
+  return { catalogue, source: state?.config?.data_source || 'binance', markets: marketsOf(), status: state?.status || {}, loading: symbolsLoading, error: catalogueError, selectedSymbol, networkHealthy };
 }
 
 function renderChartPicker() {
-  const query = $('chartAssetSearch').value.trim().toUpperCase();
-  const visible = catalogue.filter((entry) => `${entry.symbol} ${entry.base_asset || ''}`.toUpperCase().includes(query));
-  const symbol = focusedSymbol();
-  const key = `${query}|${symbol}|${symbolsLoading}|${catalogueError}|${catalogue.map((entry) => entry.symbol).join(',')}`;
-  text('chartAssetCount', symbolsLoading ? 'Liste yükleniyor…' : `${visible.length} / ${catalogue.length} varlık`);
-  text('chartAssetStatus', catalogueError ? `Liste alınırken hata: ${catalogueError}` : state?.config?.data_source === 'demo' ? 'Sentetik demo: yalnızca örnek varlıklar.' : 'Binance Spot · tüm aktif USDT pariteleri');
-  $('chartPickerRefresh').disabled = symbolsLoading;
-  if (chartPickerKey === key) return;
-  chartPickerKey = key;
-  const fragment = document.createDocumentFragment();
-  visible.forEach((entry, index) => {
-    const option = document.createElement('button');
-    option.type = 'button'; option.className = 'chart-asset-option'; option.id = `chart-asset-${index}`;
-    option.setAttribute('role', 'option'); option.setAttribute('aria-selected', String(entry.symbol === symbol)); option.tabIndex = -1;
-    option.dataset.symbol = entry.symbol;
-    const base = document.createElement('strong'); base.textContent = entry.base_asset || entry.symbol.replace(/USDT$/, '');
-    const pair = document.createElement('span'); pair.textContent = entry.symbol;
-    const check = document.createElement('span'); check.className = 'chart-asset-check'; check.textContent = entry.symbol === symbol ? '✓' : '';
-    option.append(base, pair, check);
-    option.addEventListener('mousedown', (event) => event.preventDefault());
-    option.addEventListener('click', () => { closeChartPicker(); selectChartSymbol(entry.symbol); });
-    fragment.append(option);
-  });
-  if (!visible.length) {
-    const empty = document.createElement('p'); empty.className = 'chart-picker-empty';
-    empty.textContent = symbolsLoading ? 'Varlık listesi yükleniyor…' : query ? 'Eşleşen varlık bulunamadı.' : 'Varlık listesi alınamadı. Yenile düğmesiyle tekrar deneyin.';
-    fragment.append(empty);
-  }
-  $('chartAssetList').replaceChildren(fragment);
-  highlightChartOption(query ? 0 : Math.max(0, visible.findIndex((entry) => entry.symbol === symbol)));
-}
-
-function openChartPicker() {
-  $('chartAssetSearch').value = '';
-  chartPickerKey = '';
-  $('chartAssetPicker').hidden = false;
-  $('chartPickerButton').setAttribute('aria-expanded', 'true');
-  $('chartAssetSearch').setAttribute('aria-expanded', 'true');
-  renderChartPicker();
-  $('chartAssetList').scrollTop = 0;
-  $('chartAssetSearch').focus({ preventScroll: true });
-  if (!catalogue.length && !symbolsLoading) loadSymbols(true);
-}
-
-function closeChartPicker(restoreFocus = true) {
-  $('chartAssetPicker').hidden = true;
-  $('chartPickerButton').setAttribute('aria-expanded', 'false');
-  $('chartAssetSearch').setAttribute('aria-expanded', 'false');
-  if (restoreFocus) $('chartPickerButton').focus({ preventScroll: true });
+  if (!chartPicker) chartPicker = new SpotAssetPicker({ trigger: $('chartPickerButton'), anchor: $('chartPickerButton').closest('.chart-picker-anchor'), title: 'Grafikte gösterilecek varlık', onSelect: (symbol) => selectChartSymbol(symbol), onRefresh: () => loadSymbols(true) });
+  if (!manualPicker) manualPicker = new SpotAssetPicker({ trigger: $('manualPickerButton'), anchor: $('manualPickerAnchor'), title: 'Manuel işlem için varlık seçin', onSelect: (symbol) => {
+    $('manualSymbol').value = symbol;
+    $('manualSymbol').setCustomValidity('');
+    manualSymbolTouched = true;
+    updateManualControls();
+  }, onRefresh: () => loadSymbols(true) });
+  chartPicker.update(pickerContext(focusedSymbol()));
+  manualPicker.update(pickerContext($('manualSymbol').value.trim().toUpperCase()));
 }
 
 function selectChartSymbol(symbol, scroll = false) {
@@ -408,81 +357,12 @@ async function api(path, options = {}) {
   } finally { clearTimeout(timer); }
 }
 
-function chartIdentity(market) { return `${market.symbol}|${state?.config?.data_source}|${state?.config?.interval}`; }
-
-function rememberChart(map, key, value) {
-  map.delete(key); map.set(key, value);
-  if (map.size > 64) map.delete(map.keys().next().value);
-}
-
-async function loadChartHistory(market, key) {
-  if (chartRequests.has(key)) return;
-  const previous = chartHistories.get(key);
-  if (previous && Date.now() - previous.requestedAt < 30000) return;
-  const requestedAt = Date.now();
-  const source = state.config.data_source;
-  const interval = state.config.interval;
-  chartRequests.add(key);
-  try {
-    const data = await api(`/api/chart?symbol=${encodeURIComponent(market.symbol)}&interval=${encodeURIComponent(interval)}`);
-    if (data.symbol !== market.symbol || data.interval !== interval || Boolean(data.is_synthetic) !== (source === 'demo')) throw new Error('Grafik verisinin paritesi veya kaynağı uyuşmuyor.');
-    rememberChart(chartHistories, key, { ...data, requestedAt });
-  } catch (error) {
-    rememberChart(chartHistories, key, { ...previous, requestedAt, history_stale: true, error: error.message });
-  } finally {
-    chartRequests.delete(key);
-    if (state && chartIdentity(focusedMarket(state)) === key) updateChart(focusedMarket(state));
-  }
-}
-
 function updateChart(market) {
-  const key = chartIdentity(market);
-  if (chartKey !== key) { chartKey = key; chartPoints = chartSessions.get(key) || []; }
-  const history = chartHistories.get(key);
-  const now = Date.now();
-  const quoteTime = instant(market.updated_at);
-  const n = numeric(market.price);
-  const fresh = Boolean(n > 0 && networkHealthy && state?.status?.fresh && quoteTime && now - quoteTime < 30000 && lastStateSuccessAt && now - lastStateSuccessAt < 30000);
-  if (fresh && n > 0) {
-    const last = chartPoints[chartPoints.length - 1];
-    if (!last || last.time !== quoteTime) chartPoints.push({ price: n, time: quoteTime });
-    if (chartPoints.length > 80) chartPoints.shift();
-    rememberChart(chartSessions, key, chartPoints);
+  if (!mainCandleChart) {
+    displayInterval = state?.config?.interval || '5m';
+    mainCandleChart = new SpotMarketChart($('mainMarketChart'), { interval: displayInterval, height: 280, onIntervalChange: (interval) => { displayInterval = interval; text('chartInterval', interval); } });
   }
-  const candles = (history?.candles || []).map((bar) => ({ price: numeric(bar.close), time: instant(bar.close_time) })).filter((point) => point.price > 0 && point.time);
-  const latestCandle = candles[candles.length - 1]?.time || 0;
-  const samples = [...candles, ...chartPoints.filter((point) => point.time > latestCandle)].sort((a, b) => a.time - b.time);
-  const ready = samples.length > 1;
-  $('chartPlaceholder').hidden = ready;
-  text('chartPlaceholder', history?.error ? `Fiyat geçmişi alınamadı: ${history.error}` : 'Seçili varlığın fiyat geçmişi yükleniyor…');
-  text('chartHistoryStatus', history?.error || history?.history_stale ? `Geçmiş güncel değil${history.error ? ` · ${history.error}` : ' · yenileme bekleniyor'}` : candles.length ? `${candles.length} kapanmış mum · ${state.config.interval}${fresh ? ' · canlı fiyat' : ' · güncel fiyat bekleniyor'}` : 'Fiyat geçmişi yükleniyor…');
-  $('chartHistoryStatus').classList.toggle('negative', Boolean(history?.error || history?.history_stale));
-  text('chartLegend', candles.length ? 'Mum kapanışları + fiyat akışı' : 'Bu oturumdaki fiyat akışı');
-  const position = positionsOf().find((entry) => entry.symbol === market.symbol);
-  const entryPrice = numeric(position?.entry_price);
-  $('chartEntryLabel').hidden = !ready || !entryPrice;
-  if (!ready) {
-    ['chartLine', 'chartArea', 'chartEntryLine'].forEach((id) => $(id).setAttribute('d', ''));
-    text('chartHigh', '—'); text('chartStartTime', '—'); text('chartEndTime', '—');
-  } else {
-    const values = samples.map((point) => point.price);
-    const low = Math.min(...values, ...(entryPrice ? [entryPrice] : []));
-    const high = Math.max(...values, ...(entryPrice ? [entryPrice] : []));
-    const spread = high - low || high * 0.002 || 1;
-    const minTime = samples[0].time;
-    const duration = samples[samples.length - 1].time - minTime || 1;
-    const y = (value) => high === low ? 75 : 130 - ((value - low) / spread) * 110;
-    const coords = samples.map((point) => `${((point.time - minTime) / duration * 700).toFixed(2)},${y(point.price).toFixed(2)}`);
-    const line = `M${coords.join(' L')}`;
-    $('chartLine').setAttribute('d', line);
-    $('chartArea').setAttribute('d', `${line} L700,150 L0,150 Z`);
-    $('chartEntryLine').setAttribute('d', entryPrice ? `M0 ${y(entryPrice).toFixed(2)}H700` : '');
-    text('chartEntryLabel', `Alış ${price(entryPrice)}`);
-    $('chartEntryLabel').style.top = `${y(entryPrice || low) / 150 * 100}%`;
-    text('chartHigh', `${price(low)} – ${price(high)} USDT`);
-    text('chartStartTime', dateTime(samples[0].time)); text('chartEndTime', dateTime(samples[samples.length - 1].time));
-  }
-  loadChartHistory(market, key);
+  mainCandleChart.update({ symbol: market.symbol, source: state.config.data_source, market, position: positionsOf().find((position) => position.symbol === market.symbol), networkHealthy, statusFresh: state.status.fresh });
 }
 
 function renderChartPosition(market, positions) {
@@ -558,7 +438,7 @@ function render(current, local = false) {
   text('feeSummary', `Alış ${percent(config.buy_fee_pct)} · Satış ${percent(config.sell_fee_pct)}`);
   text('cashBalance', `${money(account.cash)} USDT`);
   text('marketTitle', String(market.symbol || '—').replace(/USDT$/, ' / USDT'));
-  text('chartInterval', config.interval || '—');
+  text('chartInterval', displayInterval || config.interval || '—');
   $('chartPickerButton').setAttribute('aria-label', `${market.symbol || 'Varlık'} grafiği, tüm varlıkları göster`);
   renderChartPicker();
   text('marketPrice', price(market.price));
@@ -776,7 +656,7 @@ async function control(action, symbol) {
   const version = emergencyVersion;
   try {
     const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ action, ...(symbol ? { symbol } : {}), ...(action === 'clear_emergency' ? { expected_emergency_revision: state?.emergency?.revision } : {}) }) });
-    if (action === 'reset') { configDirty = false; hasHydrated = false; chartPoints = []; fillsInitialized = false; seenEntries = new Set(); seenExits = new Set(); $('latestExecution').hidden = true; }
+    if (action === 'reset') { configDirty = false; hasHydrated = false; fillsInitialized = false; seenEntries = new Set(); seenExits = new Set(); $('latestExecution').hidden = true; }
     if (result.config && version === emergencyVersion) render(result);
     await fetchState();
     if (version === emergencyVersion) toast({ start: 'Bot başlatıldı. Yalnızca deneme işlemleri yapılır.', pause: 'Yeni strateji işlemleri duraklatıldı. Açık pozisyonların stop takibi sürer.', close_position: `${symbol || ''} deneme pozisyonu kapatıldı.`, close_all: 'Otomasyon duraklatıldı ve tüm deneme pozisyonları kapatıldı.', reset: 'Deneme defteri sıfırlandı.', clear_emergency: 'Acil kilit kaldırıldı. Bot duraklatılmış durumda; otomasyon için ayrıca Başlat seçin.' }[action]);
@@ -879,21 +759,6 @@ $('focusForm').addEventListener('submit', (event) => {
   }
   selectChartSymbol(symbol);
 });
-$('chartPickerButton').addEventListener('click', () => { if ($('chartAssetPicker').hidden) openChartPicker(); else closeChartPicker(); });
-$('chartPickerClose').addEventListener('click', () => closeChartPicker());
-$('chartPickerRefresh').addEventListener('click', () => loadSymbols(true));
-$('chartAssetSearch').addEventListener('input', () => { chartPickerIndex = 0; renderChartPicker(); });
-$('chartAssetSearch').addEventListener('keydown', (event) => {
-  if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
-    event.preventDefault();
-    highlightChartOption(event.key === 'Home' ? 0 : event.key === 'End' ? chartPickerOptions().length - 1 : chartPickerIndex + (event.key === 'ArrowDown' ? 1 : -1), true);
-  } else if (event.key === 'Enter') {
-    event.preventDefault(); chartPickerOptions()[chartPickerIndex]?.click();
-  }
-});
-$('chartAssetPicker').addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); closeChartPicker(); } });
-document.addEventListener('click', (event) => { if (!$('chartAssetPicker').hidden && !event.target.closest('.chart-picker-anchor')) closeChartPicker(false); });
-document.addEventListener('focusin', (event) => { if (!$('chartAssetPicker').hidden && !event.target.closest('.chart-picker-anchor')) closeChartPicker(false); });
 $('chartClosePosition').addEventListener('click', () => { const symbol = focusedSymbol(); if (positionsOf().some((position) => position.symbol === symbol)) control('close_position', symbol); });
 $('resetButton').addEventListener('click', () => { $('resetDialog').returnValue = ''; $('resetDialog').showModal(); });
 $('resetDialog').addEventListener('cancel', () => { $('resetDialog').returnValue = 'cancel'; });
@@ -921,16 +786,7 @@ document.querySelectorAll('[data-positions-window]').forEach((link) => link.addE
     event.preventDefault();
   }
 }));
-document.querySelectorAll('nav a').forEach((link) => link.addEventListener('click', () => { document.querySelectorAll('[data-positions-window]').forEach((link) => link.addEventListener('click', (event) => {
-  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-  const popup = window.open('', 'spot-positions', 'popup=yes,width=1440,height=960');
-  if (popup) {
-    popup.opener = null;
-    popup.location.href = link.href;
-    event.preventDefault();
-  }
-}));
-document.querySelectorAll('nav a').forEach((item) => item.classList.remove('active')); link.classList.add('active'); }));
+document.querySelectorAll('nav a').forEach((link) => link.addEventListener('click', () => { document.querySelectorAll('nav a').forEach((item) => item.classList.remove('active')); link.classList.add('active'); }));
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') fetchState(); });
 updateButtons();
 fetchState();

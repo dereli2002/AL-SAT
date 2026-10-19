@@ -21,11 +21,13 @@ let catalogueBusy = false;
 let catalogueRetryAt = 0;
 let catalogueError = '';
 const cards = new Map();
-const chartCache = new Map();
-const chartSessions = new Map();
-const chartRequests = new Set();
-const chartQueue = [];
-let chartActive = 0;
+const buyPicker = new SpotAssetPicker({
+  trigger: $('windowBuyPickerButton'),
+  anchor: $('windowBuyPickerAnchor'),
+  title: 'İşlem yapılacak varlık',
+  onSelect: (symbol) => { $('windowBuySymbol').value = symbol; renderBuy(); },
+  onRefresh: () => loadSymbols(state?.config?.data_source),
+});
 
 function numeric(value) {
   if (value === '' || value === null || value === undefined) return null;
@@ -85,109 +87,23 @@ async function api(path, options = {}) {
   } finally { clearTimeout(timer); }
 }
 
-function chartKey(symbol) { return `${symbol}|${state?.config?.data_source}|${state?.config?.interval}`; }
-function boundedSet(map, key, value) {
-  map.delete(key); map.set(key, value);
-  if (map.size > 150) map.delete(map.keys().next().value);
-}
-function scheduleChart(symbol) {
-  const key = chartKey(symbol);
-  const cached = chartCache.get(key);
-  if (chartRequests.has(key) || (cached && Date.now() - cached.requestedAt < 30000)) return;
-  chartRequests.add(key);
-  chartQueue.push({ key, symbol, source: state.config.data_source, interval: state.config.interval });
-  pumpCharts();
-}
-function pumpCharts() {
-  while (chartActive < 3 && chartQueue.length) {
-    const task = chartQueue.shift();
-    if (!positions().some((position) => position.symbol === task.symbol) || chartKey(task.symbol) !== task.key) {
-      chartRequests.delete(task.key); continue;
-    }
-    chartActive += 1;
-    loadChart(task).finally(() => { chartActive -= 1; chartRequests.delete(task.key); pumpCharts(); });
-  }
-}
-async function loadChart(task) {
-  const previous = chartCache.get(task.key);
-  const requestedAt = Date.now();
-  try {
-    const data = await api(`/api/chart?symbol=${encodeURIComponent(task.symbol)}&interval=${encodeURIComponent(task.interval)}`);
-    if (data.symbol !== task.symbol || data.interval !== task.interval || Boolean(data.is_synthetic) !== (task.source === 'demo')) throw new Error('Grafik paritesi veya veri kaynağı uyuşmuyor.');
-    boundedSet(chartCache, task.key, { ...data, requestedAt });
-  } catch (error) {
-    boundedSet(chartCache, task.key, { ...previous, requestedAt, history_stale: true, error: error.message });
-  }
-  const position = positions().find((entry) => entry.symbol === task.symbol);
-  if (position && chartKey(task.symbol) === task.key && cards.has(task.symbol)) renderChart(cards.get(task.symbol), position);
-}
-
 function createCard(symbol) {
   const element = document.createElement('article');
   element.className = 'position-graph-card';
   element.dataset.positionSymbol = symbol;
   // Only fixed markup is parsed. Exchange symbols and all API values use textContent.
-  element.innerHTML = '<header class="position-graph-heading"><div><h2 data-field="symbol"></h2><small data-field="quantity"></small></div><div class="position-graph-quote"><strong data-field="price">—</strong><small data-field="quote">Fiyat bekleniyor</small></div></header><div class="position-graph-range"><span data-field="range">—</span><span data-field="interval">—</span></div><div class="position-graph"><svg viewBox="0 0 700 190" preserveAspectRatio="none" role="img"><path d="M0 30H700M0 95H700M0 160H700" class="chart-grid"/><path data-field="area" class="position-area"/><path data-field="line" class="position-price-line"/><path data-field="entryLine" class="position-entry-line"/><path data-field="fixedLine" class="position-stop-line"/><path data-field="trailingLine" class="position-trailing-line"/></svg><span data-field="entryLabel" class="position-graph-entry-label" hidden></span><p data-field="placeholder" class="position-graph-placeholder">Fiyat geçmişi yükleniyor…</p></div><div class="position-graph-times"><span data-field="startTime">—</span><span data-field="endTime">—</span></div><div class="position-graph-details"><div><span>Alış fiyatı · USDT</span><strong data-field="entry">—</strong></div><div><span>Anlık net kâr / zarar</span><strong data-field="pnl">—</strong><small data-field="pnlPct">—</small></div><div><span>Alış altı stop · USDT</span><strong data-field="fixed">—</strong></div><div><span>Kâr takip stopu · USDT</span><strong data-field="trailing">—</strong><small data-field="trailingStatus"></small></div><div><span>Alış maliyeti · USDT</span><strong data-field="cost">—</strong></div><div><span>Açılış zamanı</span><strong data-field="opened">—</strong></div></div><div class="position-graph-actions"><p>İzlemek işlemi kapatmaz. Otomasyon açıksa strateji ve stop kuralları işlemeye devam eder.</p><button data-close-position type="button" class="button button-danger">SAT / POZİSYONU KAPAT</button></div><p data-field="historyStatus" class="position-graph-status">Fiyat geçmişi yükleniyor…</p>';
+  element.innerHTML = '<header class="position-graph-heading"><div><h2 data-field="symbol"></h2><small data-field="quantity"></small></div><div class="position-graph-quote"><strong data-field="price">—</strong><small data-field="quote">Fiyat bekleniyor</small></div></header><div class="position-market-chart"></div><div class="position-graph-details"><div><span>Alış fiyatı · USDT</span><strong data-field="entry">—</strong></div><div><span>Anlık net kâr / zarar</span><strong data-field="pnl">—</strong><small data-field="pnlPct">—</small></div><div><span>Alış altı stop · USDT</span><strong data-field="fixed">—</strong></div><div><span>Kâr takip stopu · USDT</span><strong data-field="trailing">—</strong><small data-field="trailingStatus"></small></div><div><span>Alış maliyeti · USDT</span><strong data-field="cost">—</strong></div><div><span>Açılış zamanı</span><strong data-field="opened">—</strong></div></div><div class="position-graph-actions"><p>İzlemek işlemi kapatmaz. Otomasyon açıksa strateji ve stop kuralları işlemeye devam eder.</p><button data-close-position type="button" class="button button-danger">SAT / POZİSYONU KAPAT</button></div>';
   const fields = Object.fromEntries([...element.querySelectorAll('[data-field]')].map((node) => [node.dataset.field, node]));
   const close = element.querySelector('[data-close-position]');
   close.dataset.closePosition = symbol;
   close.setAttribute('aria-label', `${symbol} deneme pozisyonunu sat ve kapat`);
   close.addEventListener('click', () => control('close_position', symbol));
-  element.querySelector('svg').setAttribute('aria-label', `${symbol} fiyat geçmişi, alış ve stop seviyeleri`);
   text(fields.symbol, `${symbol.replace(/USDT$/, '')} / USDT`);
-  const card = { element, fields, close };
+  const chart = new SpotMarketChart(element.querySelector('.position-market-chart'), { interval: '5m', height: 230 });
+  const card = { element, fields, close, chart };
   cards.set(symbol, card);
   $('positionsGrid').append(element);
   return card;
-}
-
-function renderChart(card, position) {
-  const fields = card.fields;
-  const key = chartKey(position.symbol);
-  const history = chartCache.get(key);
-  const market = marketFor(position.symbol);
-  let session = chartSessions.get(key) || [];
-  const stamp = instant(market.updated_at);
-  if (freshPosition(position) && stamp && (!session.length || session[session.length - 1].time !== stamp)) {
-    session.push({ time: stamp, price: numeric(market.price) });
-    if (session.length > 100) session.shift();
-    boundedSet(chartSessions, key, session);
-  }
-  const candles = (history?.candles || []).map((candle) => ({ price: numeric(candle.close), time: instant(candle.close_time) })).filter((point) => point.price > 0 && point.time);
-  const lastCandle = candles[candles.length - 1]?.time || 0;
-  const points = [...candles, ...session.filter((point) => point.time > lastCandle)].sort((a, b) => a.time - b.time);
-  const ready = points.length > 1;
-  fields.placeholder.hidden = ready;
-  fields.entryLabel.hidden = !ready;
-  text(fields.placeholder, history?.error ? `Grafik alınamadı: ${history.error}` : 'Fiyat geçmişi yükleniyor…');
-  text(fields.interval, state?.config?.interval || '—');
-  const staleHistory = Boolean(history?.history_stale || history?.error);
-  text(fields.historyStatus, history?.error ? `Grafik geçmişi güncel değil: ${history.error}` : candles.length ? `${candles.length} kapanmış mum · ${state.config.interval} · ${history.history_stale ? 'geçmiş yenilenmesi bekleniyor' : freshPosition(position) ? 'güncel fiyat akışı' : 'güncel fiyat bekleniyor'}` : 'Grafik geçmişi yükleniyor…');
-  fields.historyStatus.classList.toggle('negative', staleHistory);
-  if (!ready) {
-    ['line', 'area', 'entryLine', 'fixedLine', 'trailingLine'].forEach((field) => fields[field].setAttribute('d', ''));
-    text(fields.range, '—'); text(fields.startTime, '—'); text(fields.endTime, '—');
-    return;
-  }
-  const entry = numeric(position.entry_price);
-  const fixed = numeric(position.fixed_stop_price);
-  const trailing = position.trailing_active ? numeric(position.trailing_stop_price) : null;
-  const values = [...points.map((point) => point.price), ...[entry, fixed, trailing].filter((value) => value > 0)];
-  const low = Math.min(...values);
-  const high = Math.max(...values);
-  const spread = high - low || high * 0.002 || 1;
-  const y = (value) => high === low ? 95 : 175 - (value - low) / spread * 160;
-  const start = points[0].time;
-  const duration = points[points.length - 1].time - start || 1;
-  const line = `M${points.map((point) => `${((point.time - start) / duration * 700).toFixed(2)},${y(point.price).toFixed(2)}`).join(' L')}`;
-  fields.line.setAttribute('d', line);
-  fields.area.setAttribute('d', `${line} L700,190 L0,190 Z`);
-  for (const [field, value] of [['entryLine', entry], ['fixedLine', fixed], ['trailingLine', trailing]]) fields[field].setAttribute('d', value > 0 ? `M0 ${y(value).toFixed(2)}H700` : '');
-  text(fields.entryLabel, `Alış ${price(entry)}`);
-  fields.entryLabel.style.top = `${y(entry) / 190 * 100}%`;
-  text(fields.range, `${price(low)} – ${price(high)} USDT`);
-  text(fields.startTime, dateTime(start));
-  text(fields.endTime, dateTime(points[points.length - 1].time));
 }
 
 function renderCard(position) {
@@ -210,11 +126,27 @@ function renderCard(position) {
   card.element.classList.toggle('is-stale', !fresh);
   card.close.disabled = requestBusy || emergencyBusy || !fresh;
   card.close.title = fresh ? 'Bu paritenin tamamını satar; diğer pozisyonlar açık kalır.' : 'Güncel fiyat gelmeden satış yapılamaz. Acil durdurma kilidi her zaman uygulanabilir.';
-  renderChart(card, position);
-  scheduleChart(position.symbol);
+  card.chart.update({
+    symbol: position.symbol,
+    source: state.config.data_source,
+    market: marketFor(position.symbol),
+    position,
+    networkHealthy,
+    statusFresh: state.status?.fresh,
+  });
 }
 
 function renderBuy() {
+  buyPicker.update({
+    catalogue,
+    source: state?.config?.data_source,
+    markets: markets(),
+    status: state?.status,
+    loading: catalogueBusy,
+    error: catalogueError,
+    selectedSymbol: $('windowBuySymbol').value,
+    networkHealthy,
+  });
   const symbol = $('windowBuySymbol').value.trim().toUpperCase();
   const amount = numeric($('windowBuyAmount').value);
   const alreadyOpen = positions().some((position) => position.symbol === symbol);
@@ -256,11 +188,11 @@ function render() {
   $('windowUnlock').disabled = requestBusy || emergencyBusy || !active || open.length > 0 || pending.length > 0;
   $('positionsEmpty').hidden = open.length > 0;
   const symbols = new Set(open.map((position) => position.symbol));
-  for (const [symbol, card] of cards) if (!symbols.has(symbol)) { card.element.remove(); cards.delete(symbol); }
+  for (const [symbol, card] of cards) if (!symbols.has(symbol)) { card.chart.dispose(); card.element.remove(); cards.delete(symbol); }
   open.forEach(renderCard);
   renderBuy();
   const source = state.config.data_source;
-  if (catalogueSource !== source && !catalogueBusy && Date.now() >= catalogueRetryAt) loadSymbols(source);
+  if ((catalogueSource !== source || catalogueError) && !catalogueBusy && Date.now() >= catalogueRetryAt) loadSymbols(source);
 }
 
 async function loadSymbols(source) {
@@ -269,7 +201,6 @@ async function loadSymbols(source) {
   catalogueError = '';
   if (catalogueSource !== source) {
     catalogue = [];
-    $('windowSymbols').replaceChildren();
   }
   text($('windowCatalogStatus'), 'Varlık listesi yükleniyor…');
   $('windowRefreshSymbols').disabled = true;
@@ -278,9 +209,6 @@ async function loadSymbols(source) {
     const data = await api('/api/symbols');
     if (state?.config?.data_source !== source || Boolean(data.is_synthetic) !== (source === 'demo')) return;
     catalogue = Array.isArray(data.symbols) ? data.symbols : [];
-    const fragment = document.createDocumentFragment();
-    for (const entry of catalogue) { const option = document.createElement('option'); option.value = entry.symbol; fragment.append(option); }
-    $('windowSymbols').replaceChildren(fragment);
     catalogueSource = source;
     catalogueError = data.error || '';
     catalogueRetryAt = data.error ? Date.now() + 60000 : 0;
