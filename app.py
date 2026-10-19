@@ -4,7 +4,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from bot.service import BotService
 
@@ -36,6 +36,14 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(self.service.state())
         elif path=='/api/symbols':
             self.respond(self.service.symbols())
+        elif path=='/api/chart':
+            try:
+                query=parse_qs(urlparse(self.path).query)
+                self.respond(self.service.chart(query.get('symbol',[None])[0],query.get('interval',[None])[0]))
+            except (ValueError,TypeError,KeyError,ArithmeticError) as exc:
+                self.respond({'error':str(exc)},400)
+            except Exception as exc:
+                self.respond({'error':f'{type(exc).__name__}: {exc}'},502)
         elif path=='/api/health':
             state=self.service.state()
             self.respond(dict(ok=True,mode='paper',market_ready=state['status']['fresh'],

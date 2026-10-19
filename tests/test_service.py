@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from bot.service import BotService, Store
+from bot.service import BotService, Store, CHART_CACHE_SIZE, CHART_CACHE_TTL
 from bot.market import DemoMarket
 from bot.core import DEFAULT_CONFIG, PaperBroker
 from app import Handler
@@ -282,6 +282,109 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(self.service._backoff_until,__import__('time').monotonic())
         self.assertFalse(self.service.state()['status']['fresh'])
 
+    def test_chart_returns_immediate_history_without_affecting_open_portfolio(self):
+        self.enter()
+        before=self.service.portfolio.export_state()
+        focused=self.service.configure(dict(symbol='ETHUSDT'))
+        self.assertTrue(focused['status']['running'])
+        with patch.object(self.feed,'candles',wraps=self.feed.candles) as candles:
+            chart=self.service.chart('ETHUSDT','5m')
+            self.assertEqual(100,len(chart['candles']))
+            self.assertEqual('ETHUSDT',chart['symbol'])
+            self.assertTrue(chart['quote_fresh'])
+            self.assertFalse(chart['history_stale'])
+            self.assertEqual('100',chart['price'])
+            self.assertEqual(1,candles.call_count)
+            again=self.service.chart('ETHUSDT','5m')
+            self.assertTrue(again['cached'])
+            self.assertEqual(1,candles.call_count)
+        self.assertEqual(before,self.service.portfolio.export_state())
+        self.assertTrue(self.service.state()['status']['running'])
+
+    def test_chart_reuses_scanner_history_and_bounds_cache(self):
+        self.settle()
+        with patch.object(self.feed,'candles') as candles:
+            chart=self.service.chart('BTCUSDT','5m')
+            self.assertTrue(chart['cached'])
+            self.assertEqual(100,len(chart['candles']))
+            candles.assert_not_called()
+        with self.service.lock:
+            for index in range(CHART_CACHE_SIZE+10):
+                self.service._remember_chart(f'COIN{index}USDT','1m',chart['candles'])
+        self.assertEqual(CHART_CACHE_SIZE,len(self.service._chart_cache))
+        self.assertNotIn(('BTCUSDT','5m'),self.service._chart_cache)
+
+    def test_chart_focus_accepts_open_position_after_catalog_removal(self):
+        self.enter()
+        self.service._catalog=[pair for pair in self.service._catalog if pair['symbol']!='BTCUSDT']
+        self.service.configure(dict(symbol='ETHUSDT'))
+        state=self.service.configure(dict(symbol='BTCUSDT'))
+        self.assertTrue(state['status']['running'])
+        self.assertEqual('BTCUSDT',state['position']['symbol'])
+        self.assertEqual('BTCUSDT',self.service.chart('BTCUSDT','5m')['symbol'])
+
+    def test_chart_marks_cached_history_stale_when_network_fails_and_stale_quote(self):
+        self.settle()
+        self.service._chart_cache[('BTCUSDT','5m')]['fetched']-=CHART_CACHE_TTL+1
+        self.service._last_success-=31
+        with patch.object(self.feed,'candles',side_effect=ConnectionError('offline')):
+            chart=self.service.chart('BTCUSDT','5m')
+        self.assertEqual(100,len(chart['candles']))
+        self.assertTrue(chart['history_stale'])
+        self.assertFalse(chart['quote_fresh'])
+        self.assertIn('offline',chart['error'])
+
+    def test_chart_shares_backoff_and_records_rate_limits(self):
+        self.settle()
+        class Limited(Exception):
+            retry_after=60
+        with patch.object(self.feed,'candles',side_effect=Limited('429')) as candles:
+            with self.assertRaises(Limited):
+                self.service.chart('ETHUSDT','5m')
+            self.assertGreater(self.service._backoff_until,__import__('time').monotonic())
+            self.assertTrue(self.service.chart('BTCUSDT','5m')['history_stale'])
+            with self.assertRaises(ValueError):
+                self.service.chart('ETHUSDT','5m')
+            self.assertEqual(1,candles.call_count)
+
+    def test_chart_fetch_keeps_portfolio_lock_free_and_rejects_changed_source(self):
+        self.settle()
+        entered,release=threading.Event(),threading.Event()
+        outcome=[]
+        original=self.feed.candles
+        def delayed(*args):
+            entered.set()
+            release.wait(2)
+            return original(*args)
+        def load():
+            try:
+                outcome.append(self.service.chart('ETHUSDT','5m'))
+            except Exception as exc:
+                outcome.append(exc)
+        with patch.object(self.feed,'candles',side_effect=delayed):
+            worker=threading.Thread(target=load)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(self.service.lock.acquire(timeout=.5))
+                self.service.lock.release()
+                state=self.service.control('emergency_close')
+                self.assertTrue(state['emergency']['active'])
+                self.service.configure(dict(data_source='binance'))
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertEqual(1,len(outcome))
+        self.assertIsInstance(outcome[0],ValueError)
+        self.assertIn('ayarlar değişti',str(outcome[0]))
+        self.assertEqual(0,len(self.service._chart_cache))
+
+    def test_chart_rejects_invalid_symbol_and_interval(self):
+        self.settle()
+        for symbol,interval in (('BAD/USDT','5m'),('MISSINGUSDT','5m'),('ETHUSDT','2m')):
+            with self.subTest(symbol=symbol,interval=interval), self.assertRaises(ValueError):
+                self.service.chart(symbol,interval)
+
     def test_legacy_database_migrates_and_is_backed_up(self):
         config={**DEFAULT_CONFIG,'symbol':'BTCUSDT','interval':'5m','strategy':'ema_cross','data_source':'demo'}
         broker=PaperBroker(config)
@@ -335,6 +438,13 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual('estimate',json.load(result)['fee_info']['kind'])
                 with urlopen(base+'/api/symbols') as result:
                     self.assertEqual(3,len(json.load(result)['symbols']))
+                with urlopen(base+'/api/chart?symbol=ETHUSDT&interval=5m') as result:
+                    chart=json.load(result)
+                    self.assertEqual('ETHUSDT',chart['symbol'])
+                    self.assertEqual(100,len(chart['candles']))
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(base+'/api/chart?symbol=INVALID&interval=5m')
+                self.assertEqual(400,caught.exception.code)
                 patch=Request(base+'/api/config',data=json.dumps(dict(data_source='demo')).encode(),
                               method='PATCH',headers={'Content-Type':'application/json'})
                 with urlopen(patch) as result:

@@ -1,5 +1,6 @@
 """Persistent multi-asset paper portfolio and rate-aware Spot scanner."""
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -19,6 +20,8 @@ APP_DEFAULTS = dict(symbol='BTCUSDT', symbols=['BTCUSDT','ETHUSDT','SOLUSDT'],
                     universe_mode='all', max_open_positions=5, interval='5m',
                     strategy='hybrid', data_source='binance')
 SCAN_BATCH_SIZE = 12
+CHART_CACHE_SIZE = 64
+CHART_CACHE_TTL = 30
 
 
 def validated_config(config):
@@ -96,6 +99,7 @@ class BotService:
         self._executor=ThreadPoolExecutor(max_workers=4,thread_name_prefix='candle-scan')
         self._pending={}
         self._cache={}
+        self._chart_cache=OrderedDict()
         self._next_due={}
         self._cursor=0
         self._catalog=[]
@@ -168,6 +172,73 @@ class BotService:
                 self.error='Borsa istek sınırı: yeni istekler ve alımlar bekliyor.'
                 self.market['error']=self.error
 
+    def _remember_chart(self,symbol,interval,bars):
+        """Called with the service lock; chart reads never alter trade signals."""
+        key=(symbol,interval)
+        self._chart_cache[key]=dict(candles=deepcopy(bars),fetched=time.monotonic(),
+                                    updated_at=datetime.now(timezone.utc).isoformat())
+        self._chart_cache.move_to_end(key)
+        while len(self._chart_cache)>CHART_CACHE_SIZE:
+            self._chart_cache.popitem(last=False)
+
+    def _chart_payload(self,symbol,interval,entry,*,cached,error=None):
+        quote_fresh=(not self.market['error'] and self._last_success is not None
+                     and time.monotonic()-self._last_success<30
+                     and time.monotonic()>=self._backoff_until
+                     and symbol in self._prices)
+        stale=bool(error) or time.monotonic()-entry['fetched']>=CHART_CACHE_TTL
+        if not self.feed.is_synthetic and entry['candles']:
+            close=datetime.fromisoformat(entry['candles'][-1]['close_time'].replace('Z','+00:00'))
+            stale=stale or (datetime.now(timezone.utc)-close).total_seconds()>INTERVALS[interval]*2+60
+        return dict(symbol=symbol,interval=interval,source=self.feed.source,is_synthetic=self.feed.is_synthetic,
+                    candles=deepcopy(entry['candles']),price=self._prices.get(symbol),
+                    quote_time=self._quote_time,quote_fresh=quote_fresh,
+                    updated_at=entry['updated_at'],cached=cached,history_stale=stale,error=error)
+
+    def chart(self,symbol=None,interval=None):
+        """Fetch display history independently of the selected trading universe.
+
+        Candle I/O runs outside the portfolio lock so opening a chart cannot
+        delay stops or the emergency command. Previous history is explicitly
+        marked stale when the exchange cannot refresh it.
+        """
+        with self.lock:
+            symbol=symbol or self.config['symbol']
+            interval=interval or self.config['interval']
+            valid_market(symbol,interval)
+            available={item['symbol'] for item in self._catalog}|set(self.portfolio.position_symbols)
+            if available and symbol not in available:
+                raise ValueError('Seçilen sembol aktif USDT Spot listesinde veya açık pozisyonlarda yok.')
+            key=(symbol,interval)
+            entry=self._chart_cache.get(key)
+            if time.monotonic()<self._backoff_until:
+                if entry:
+                    return self._chart_payload(symbol,interval,entry,cached=True,
+                                               error='Borsa istek sınırı nedeniyle grafik yenilemesi bekliyor.')
+                raise ValueError('Borsa istek sınırı beklenirken grafik isteği gönderilemez.')
+            if entry and time.monotonic()-entry['fetched']<CHART_CACHE_TTL:
+                self._chart_cache.move_to_end(key)
+                return self._chart_payload(symbol,interval,entry,cached=True)
+            generation,feed=self._generation,self.feed
+        try:
+            bars=feed.candles(symbol,interval,100)
+            if not bars:
+                raise ValueError('Grafik için geçmiş mum verisi bulunamadı.')
+        except Exception as exc:
+            self._record_throttle(exc)
+            with self.lock:
+                if generation!=self._generation:
+                    raise ValueError('Grafik yüklenirken ayarlar değişti; yeniden deneyin.') from exc
+                entry=self._chart_cache.get(key)
+                if entry:
+                    return self._chart_payload(symbol,interval,entry,cached=True,error=str(exc))
+            raise
+        with self.lock:
+            if generation!=self._generation:
+                raise ValueError('Grafik yüklenirken ayarlar değişti; yeniden deneyin.')
+            self._remember_chart(symbol,interval,bars)
+            return self._chart_payload(symbol,interval,self._chart_cache[key],cached=False)
+
     @staticmethod
     def _scan(feed,symbol,interval):
         bars=feed.candles(symbol,interval,100)
@@ -189,6 +260,7 @@ class BotService:
             try:
                 sample=future.result()
                 bars=sample['bars']
+                self._remember_chart(symbol,config['interval'],bars)
                 details=signal_details(bars,config['strategy'])
                 self._cache[symbol]=dict(candle=bars[-1]['close_time'],signal=details['signal'],
                                          details=details,filters=sample['filters'])
@@ -343,15 +415,17 @@ class BotService:
         with self.lock:
             merged=validated_config({**self.config,**patch})
             available={item['symbol'] for item in self._catalog}
-            if available and merged['data_source']==self.config['data_source']:
-                wanted={merged['symbol']} | (set(merged['symbols']) if merged['universe_mode']=='selected' else set())
-                if wanted-available:
-                    raise ValueError('Seçilen sembol aktif USDT Spot listesinde yok.')
             if set(patch)=={'symbol'}:
+                if available and merged['symbol'] not in available|set(self.portfolio.position_symbols):
+                    raise ValueError('Seçilen sembol aktif USDT Spot listesinde veya açık pozisyonlarda yok.')
                 self.config=merged
                 self.market.update(symbol=merged['symbol'],price=self._prices.get(merged['symbol']))
                 self._save()
                 return self.state()
+            if available and merged['data_source']==self.config['data_source']:
+                wanted={merged['symbol']} | (set(merged['symbols']) if merged['universe_mode']=='selected' else set())
+                if wanted-available:
+                    raise ValueError('Seçilen sembol aktif USDT Spot listesinde yok.')
             account=self.portfolio.snapshot(self._prices)
             if self.running or account['positions']:
                 raise ValueError('Ayarlar için botu duraklatın ve açık pozisyonları kapatın.')
@@ -367,6 +441,7 @@ class BotService:
                 future.cancel()
             self._pending.clear()
             self._cache.clear()
+            self._chart_cache.clear()
             self._next_due.clear()
             self.last_candles={}
             self._cursor=0
