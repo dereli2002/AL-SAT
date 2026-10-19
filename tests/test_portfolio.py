@@ -388,6 +388,79 @@ class PortfolioTests(unittest.TestCase):
                     restored.tick({symbol: "1"}, T1)
                 self.assertEqual(restored.export_state(), before)
 
+    def test_open_return_weights_entry_cost_and_excludes_closed_trades(self):
+        portfolio = PaperPortfolio(config())
+        prices = {"BTCUSDT": "100", "ETHUSDT": "100"}
+        portfolio.buy("BTCUSDT", prices, T0, amount="100")
+        portfolio.buy("ETHUSDT", prices, T1, amount="300")
+        marks = {"BTCUSDT": "110", "ETHUSDT": "90"}
+        state = portfolio.snapshot(marks)
+        self.assertEqual(D(state["open_entry_cost"]), 400)
+        self.assertEqual(D(state["unrealized_pnl"]), -20)
+        self.assertEqual(D(state["unrealized_pnl_pct"]), -5)
+        self.assertEqual(D(state["total_pnl_pct"]), -2)
+        portfolio.sell("BTCUSDT", "110", T2, prices=marks)
+        state = portfolio.snapshot(marks)
+        self.assertEqual(D(state["realized_pnl"]), 10)
+        self.assertEqual(D(state["open_entry_cost"]), 300)
+        self.assertEqual(D(state["unrealized_pnl"]), -30)
+        self.assertEqual(D(state["unrealized_pnl_pct"]), -10)
+        portfolio.sell("ETHUSDT", "90", T3)
+        state = portfolio.snapshot({})
+        self.assertEqual(D(state["realized_pnl"]), -20)
+        for field in ("open_entry_cost", "unrealized_pnl", "unrealized_pnl_pct"):
+            self.assertEqual(D(state[field]), 0)
+        self.assertFalse(state["risk"]["valuation_stale"])
+
+    def test_open_return_includes_both_fees_and_execution_slippage(self):
+        portfolio = PaperPortfolio(config(buy_fee_pct="0.1", sell_fee_pct="0.2", slippage_pct="0.05"))
+        prices = {"BTCUSDT": "100", "ETHUSDT": "50"}
+        entries = [portfolio.buy("BTCUSDT", prices, T0, amount="100.1")[0],
+                   portfolio.buy("ETHUSDT", prices, T1, amount="300.3")[0]]
+        marks = {"BTCUSDT": "110", "ETHUSDT": "45"}
+        entry_cost = sum((D(event["net_quote"]) for event in entries), D(0))
+        proceeds = sum((D(event["quantity"]) * D(marks[event["symbol"]]) * D("0.9995") * D("0.998")
+                        for event in entries), D(0))
+        expected = proceeds - entry_cost
+        state = portfolio.snapshot(marks)
+        self.assertEqual(D(state["open_entry_cost"]), entry_cost)
+        self.assertLess(abs(D(state["unrealized_pnl"]) - expected), D("1e-23"))
+        self.assertLess(abs(D(state["unrealized_pnl_pct"]) - expected / entry_cost * 100), D("1e-23"))
+        self.assertLess(D(portfolio.snapshot(prices)["unrealized_pnl_pct"]), 0)
+        self.invariant(portfolio, marks)
+
+    def test_open_return_preserves_decimal_precision(self):
+        portfolio = PaperPortfolio(config())
+        prices = {"BTCUSDT": "100", "ETHUSDT": "100"}
+        portfolio.buy("BTCUSDT", prices, T0, amount="100.0000000000000001")
+        portfolio.buy("ETHUSDT", prices, T1, amount="300.0000000000000003")
+        marks = {"BTCUSDT": "110", "ETHUSDT": "90"}
+        state = portfolio.snapshot(marks)
+        self.assertIsInstance(state["open_entry_cost"], str)
+        self.assertEqual(D(state["open_entry_cost"]), D("400.0000000000000004"))
+        self.assertEqual(D(state["unrealized_pnl"]), D("-20.00000000000000002"))
+        self.assertEqual(D(state["unrealized_pnl_pct"]), -5)
+
+    def test_open_return_is_read_only_and_retains_missing_quote_metadata(self):
+        portfolio = PaperPortfolio(config())
+        prices = {"BTCUSDT": "100", "ETHUSDT": "100"}
+        portfolio.buy("BTCUSDT", prices, T0, amount="100")
+        portfolio.buy("ETHUSDT", prices, T1, amount="300")
+        marks = {"BTCUSDT": "110", "ETHUSDT": "90"}
+        portfolio.tick(marks, T2)
+        before = portfolio.export_state()
+        partial = portfolio.snapshot({"BTCUSDT": "110"})
+        self.assertEqual(D(partial["open_entry_cost"]), 400)
+        self.assertEqual(D(partial["unrealized_pnl_pct"]), -5)
+        self.assertTrue(partial["risk"]["valuation_stale"])
+        self.assertEqual(partial["risk"]["missing_symbols"], ["ETHUSDT"])
+        self.assertTrue(next(p for p in partial["positions"] if p["symbol"] == "ETHUSDT")["quote_missing"])
+        portfolio.snapshot({"BTCUSDT": "500", "ETHUSDT": "500"})
+        self.assertEqual(portfolio.export_state(), before)
+        restored = PaperPortfolio(portfolio.config, json.loads(json.dumps(before)))
+        self.assertEqual(restored.snapshot({"BTCUSDT": "110"}), partial)
+        self.assertEqual(restored.export_state(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

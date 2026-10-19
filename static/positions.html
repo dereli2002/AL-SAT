@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10141e">
+  <title>Açık Pozisyonlar · Spot Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/positions.css">
+  <script src="/positions.js" defer></script>
+</head>
+<body class="positions-window">
+  <header class="positions-topbar"><a class="brand" href="/" target="spot-dashboard"><span class="brand-mark" aria-hidden="true">S<span>↗</span></span><span>SPOT LAB<small>AÇIK POZİSYONLAR</small></span></a><div class="positions-topbar-right"><span class="paper-badge">DENEME MODU · GERÇEK EMİR YOK</span><a class="button button-secondary button-small" href="/" target="spot-dashboard">Ana panel ↗</a></div></header>
+  <main class="positions-main">
+    <section class="positions-heading"><div><div class="eyebrow">TÜM AÇIK İŞLEMLER · TEK EKRAN</div><h1>Açık pozisyonlar<span class="heading-dot">.</span></h1><p>Her varlığın grafiğini, alış fiyatını ve net sonucunu birlikte izleyin.</p></div><div class="positions-connection"><strong id="windowStatus" role="status">Bağlanıyor…</strong><span id="windowUpdated">Otomatik güncelleme: 3 sn</span></div></section>
+    <div id="windowError" class="error-banner" role="alert" hidden></div>
+    <div id="windowDemo" class="demo-banner" hidden>Sentetik demo fiyatları kullanılıyor. Sonuçlar gerçek piyasa performansını temsil etmez.</div>
+    <div class="positions-summary"><article><span>Açık işlemlerin anlık net kâr / zararı</span><strong id="openPnl">—</strong><small id="openPnlPct">—</small><small id="openPnlStatus">Güncel fiyat bekleniyor</small></article><article><span>Açık pozisyon sayısı</span><strong id="positionsCount">—</strong><small id="windowLimit">Pozisyon sınırı: —</small></article><article><span>Kullanılabilir bakiye</span><strong id="windowCash">—</strong><small>Ortak USDT hesabı</small></article></div>
+    <section class="card positions-controls" aria-label="Pozisyon ve otomasyon kontrolü"><div><strong id="windowAutomation">Otomasyon durumu bekleniyor</strong><p>Grafikleri izlemek işlem yapmaz. Duraklatıldığında da stop takibi sürer.</p></div><div class="positions-toolbar"><button id="windowPause" class="button button-secondary" type="button" disabled>Otomasyonu duraklat</button><button id="windowCloseAll" class="button button-danger" type="button" disabled>Tüm pozisyonları kapat</button><button id="windowEmergency" class="button button-emergency" type="button">ACİL DURDUR / TÜMÜNÜ KAPAT</button></div></section>
+    <section id="windowEmergencyBanner" class="emergency-banner" role="alert" hidden><div><strong>ACİL KİLİT · YENİ ALIŞLAR ENGELLENDİ</strong><p id="windowEmergencyDetails"></p></div><button id="windowUnlock" class="button button-danger button-small" type="button" disabled>Acil kilidini kaldır</button></section>
+    <details class="card positions-manual"><summary>Manuel AL · Yeni deneme pozisyonu aç</summary><div class="positions-catalog-status"><span id="windowCatalogStatus" role="status">Varlık listesi bekleniyor</span><button id="windowRefreshSymbols" class="button button-secondary button-small" type="button">Listeyi yenile</button></div><form id="windowBuyForm"><label>Varlık / parite<input id="windowBuySymbol" list="windowSymbols" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="BTCUSDT, ETHUSDT…" required><small id="windowBuyQuote">Varlık seçin</small></label><label>Alış tutarı · USDT<input id="windowBuyAmount" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="100.00" required><small>Alış komisyonu dahil toplam bütçe</small></label><button id="windowBuy" class="button button-primary" type="submit" disabled>AL</button></form><datalist id="windowSymbols"></datalist><p id="windowBuyStatus">Güncel fiyat, bakiye ve risk sınırları sunucuda tekrar kontrol edilir.</p></details>
+    <div id="positionsEmpty" class="positions-empty" hidden><span aria-hidden="true">⌁</span><h2>Açık pozisyon yok</h2><p>Yeni bir deneme pozisyonu açıldığında grafiği burada görünür.</p></div>
+    <section id="positionsGrid" class="positions-grid" aria-label="Açık pozisyonların grafikleri"></section>
+    <footer class="positions-footer">3 saniyede bir güncellenir. Net sonuçlar alış maliyeti, tahmini satış komisyonu ve kayması sonrasıdır. Stop fiyatları gerçekleşme fiyatını garanti etmez.</footer>
+  </main>
+  <div id="windowToast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript><div class="noscript">Bu ekran için JavaScript etkin olmalı.</div></noscript>
+</body>
+</html>

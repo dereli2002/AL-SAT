@@ -5,8 +5,9 @@ const configForm = $('configForm');
 const strategies = {
   hybrid: { name: 'Karma strateji', description: 'EMA, RSI ve kırılım oylarını birleştirir. En az iki uyumlu oy ve karşı oy yoksa işlem yapar.' },
   ema_cross: { name: 'EMA kesişimi', description: 'Kısa ve uzun dönem ortalamalarının kesişimini izler.' },
-  rsi_reversion: { name: 'RSI dönüşü', description: 'Aşırı satım sonrası toparlanma sinyallerini izler.' },
+  rsi_reversion: { name: 'RSI dönüşü', description: 'RSI 14 ≤ 30 olduğunda alış, ≥ 60 olduğunda satış arar. Düşük RSI tek başına yükseliş onayı değildir.' },
   breakout: { name: 'Fiyat kırılımı', description: 'Önceki fiyat aralığının üzerindeki kırılımı izler.' },
+  trend_breakout: { name: 'ADX filtreli trend kırılımı', description: 'EMA 20/50 yükselişi, ADX ≥ 25 ve hacim onaylı kırılım arar. ATR filtresi aşırı uzaklaşmış fiyatları eler; uygun koşul yoksa bekler.' },
 };
 const reasonNames = { stop_loss: 'Alış altı stop', fixed_stop: 'Alış altı stop', trailing_stop: 'Kâr takibi stop', trailing_price: 'Fiyat takibi stop', trailing_profit: 'Net kâr takibi', strategy: 'Strateji sinyali', signal: 'Strateji sinyali', sell_signal: 'Satış sinyali', manual: 'Manuel', manual_buy: 'Manuel alış', manual_sell: 'Manuel satış', manual_close: 'Manuel kapatma', emergency: 'Acil kapatma', emergency_close: 'Acil kapatma', daily_loss: 'Günlük risk limiti', daily_loss_limit: 'Günlük risk limiti', end_of_test: 'Test sonu', backtest_end: 'Test sonu' };
 const formatNumber = new Intl.NumberFormat('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -357,6 +358,28 @@ function paintValue(id, value, options = {}) {
     el.classList.add(n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral');
   }
 }
+
+function renderLivePnl(current = state) {
+  const positions = positionsOf(current);
+  const account = current?.account || {};
+  const missing = positions.filter((position) => position.quote_missing).map((position) => position.symbol);
+  const stamps = marketsOf(current).filter((market) => positions.some((position) => position.symbol === market.symbol)).map((market) => instant(market.updated_at));
+  const quotesOld = stamps.length !== positions.length || stamps.some((stamp) => !stamp || Date.now() - stamp >= 30000);
+  const connected = Boolean(current && networkHealthy && lastStateSuccessAt && Date.now() - lastStateSuccessAt < 30000);
+  const fresh = connected && (positions.length === 0 || (numeric(account.unrealized_pnl) !== null && current?.status?.fresh && !account.risk?.valuation_stale && !missing.length && !quotesOld));
+  const pnl = fresh ? positions.length ? account.unrealized_pnl : 0 : null;
+  const cost = numeric(account.open_entry_cost) ?? positions.reduce((sum, position) => sum + (numeric(position.entry_cost) || 0), 0);
+  const pnlPct = fresh ? positions.length ? numeric(account.unrealized_pnl_pct) ?? (cost > 0 ? numeric(pnl) / cost * 100 : null) : 0 : null;
+  paintValue('livePnl', pnl, { signed: true, color: true });
+  text('livePnlPct', percent(pnlPct, true));
+  $('livePnlPct').className = pnlPct > 0 ? 'positive' : pnlPct < 0 ? 'negative' : '';
+  text('livePositionCount', current ? `${positions.length} açık pozisyon` : 'Pozisyonlar bekleniyor');
+  const stamp = stamps.length && stamps.every(Boolean) ? Math.min(...stamps) : null;
+  text('livePnlStatus', !current ? 'Hesap verisi bekleniyor' : !connected ? 'Bağlantı yok · güncel veri bekleniyor' : !positions.length ? 'Açık işlem yok' : !fresh ? missing.length ? `Güncel fiyat eksik: ${missing.join(', ')}` : 'Güncel fiyat bekleniyor' : `Son fiyat: ${dateTime(stamp)}`);
+  $('livePnlStatus').classList.toggle('negative', !fresh);
+  $('livePnlCard').classList.toggle('is-stale', !fresh);
+  $('livePnlCard').title = 'Yalnız açık pozisyonların alış maliyeti ve tahmini satış komisyonu/kayması sonrası net sonucu. Yüzde, açık pozisyonların toplam alış maliyetine göredir.';
+}
 function toast(message, isError = false) {
   const el = $('toast');
   clearTimeout(toastTimer);
@@ -526,6 +549,7 @@ function render(current, local = false) {
   text('equity', money(account.equity));
   text('initialCash', `Başlangıç: ${money(account.initial_cash)} USDT`);
   paintValue('totalPnl', account.total_pnl, { signed: true, color: true });
+  renderLivePnl(current);
   text('totalPnlPct', percent(account.total_pnl_pct, true));
   $('totalPnlPct').className = numeric(account.total_pnl) < 0 ? 'negative' : numeric(account.total_pnl) > 0 ? 'positive' : '';
   paintValue('realizedPnl', account.realized_pnl, { signed: true, color: true });
@@ -734,6 +758,7 @@ async function fetchState() {
   try { const current = await api('/api/state'); if (version === emergencyVersion) render(current); }
   catch (error) {
     networkHealthy = false;
+    renderLivePnl();
     $('connectionStatus').className = 'connection offline';
     $('connectionStatus').replaceChildren(document.createElement('i'), document.createTextNode('Bağlantı yok'));
     $('errorBanner').hidden = false;
@@ -750,7 +775,7 @@ async function control(action, symbol) {
   requestBusy = true; updateButtons();
   const version = emergencyVersion;
   try {
-    const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ action, ...(symbol ? { symbol } : {}) }) });
+    const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ action, ...(symbol ? { symbol } : {}), ...(action === 'clear_emergency' ? { expected_emergency_revision: state?.emergency?.revision } : {}) }) });
     if (action === 'reset') { configDirty = false; hasHydrated = false; chartPoints = []; fillsInitialized = false; seenEntries = new Set(); seenExits = new Set(); $('latestExecution').hidden = true; }
     if (result.config && version === emergencyVersion) render(result);
     await fetchState();
@@ -887,8 +912,27 @@ $('backtestForm').addEventListener('submit', async (event) => {
   } catch (error) { toast(error.message, true); $('backtestEmpty').hidden = Boolean(state.backtest?.results?.length); }
   finally { backtestBusy = false; text('backtestButton', 'Geçmiş testi çalıştır'); updateButtons(); }
 });
-document.querySelectorAll('nav a').forEach((link) => link.addEventListener('click', () => { document.querySelectorAll('nav a').forEach((item) => item.classList.remove('active')); link.classList.add('active'); }));
+document.querySelectorAll('[data-positions-window]').forEach((link) => link.addEventListener('click', (event) => {
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  const popup = window.open('', 'spot-positions', 'popup=yes,width=1440,height=960');
+  if (popup) {
+    popup.opener = null;
+    popup.location.href = link.href;
+    event.preventDefault();
+  }
+}));
+document.querySelectorAll('nav a').forEach((link) => link.addEventListener('click', () => { document.querySelectorAll('[data-positions-window]').forEach((link) => link.addEventListener('click', (event) => {
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  const popup = window.open('', 'spot-positions', 'popup=yes,width=1440,height=960');
+  if (popup) {
+    popup.opener = null;
+    popup.location.href = link.href;
+    event.preventDefault();
+  }
+}));
+document.querySelectorAll('nav a').forEach((item) => item.classList.remove('active')); link.classList.add('active'); }));
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') fetchState(); });
 updateButtons();
 fetchState();
 setInterval(fetchState, 3000);
+setInterval(() => { if (state) renderLivePnl(); }, 1000);

@@ -50,7 +50,8 @@ class Handler(SimpleHTTPRequestHandler):
                               data_source=state['market']['source']))
         elif path.startswith('/api/'):
             self.respond({'error':'Bulunamadı.'},404)
-        elif path in ('/','/index.html','/app.js','/style.css'):
+        elif path in ('/','/index.html','/app.js','/style.css',
+                      '/positions.html','/positions.js','/positions.css'):
             super().do_GET()
         else:
             self.send_error(404)
@@ -73,7 +74,8 @@ class Handler(SimpleHTTPRequestHandler):
             if method=='PATCH' and path=='/api/config':
                 result=self.service.configure(payload)
             elif method=='POST' and path=='/api/control':
-                result=self.service.control(payload.get('action'),payload.get('symbol'),payload.get('amount'))
+                result=self.service.control(payload.get('action'),payload.get('symbol'),payload.get('amount'),
+                                            payload.get('expected_emergency_revision'))
             elif method=='POST' and path=='/api/backtest':
                 result=self.service.test_history(payload)
             else:

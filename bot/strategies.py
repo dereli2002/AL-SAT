@@ -25,6 +25,10 @@ STRATEGIES = {
         "name": "Karma strateji",
         "description": "EMA 12/26 trendi, RSI 14 (≤35 al / ≥65 sat) ve önceki 20 tepe / 10 dip kırılımı oy verir. En az iki aynı yönlü oy ve sıfır karşı oy varsa işlem; çelişkide veya ilk 26 mum dolmadan bekle.",
     },
+    "trend_breakout": {
+        "name": "ADX filtreli trend kırılımı",
+        "description": "Alım için kapanış > EMA20 > EMA50, yükselen EMA50, Wilder ADX14 ≥ 25, önceki 20 mum tepesinin kırılması ve önceki 20 mum ortalamasından yüksek pozitif hacim birlikte gerekir. Kapanış EMA20'nin en çok 2 × Wilder ATR14 üstünde olabilir. Kapanış EMA20 altına veya EMA20 EMA50 altına düşerse sat; en az 51 mum gerekir. Stoplar bağımsızdır; kâr garantisi yoktur.",
+    },
 }
 
 
@@ -72,6 +76,92 @@ def _rsi(values, period=14):
         gain = (gain * (period - 1) + max(change, Decimal(0))) / period
         loss = (loss * (period - 1) + max(-change, Decimal(0))) / period
         result[index] = value()
+    return result
+
+
+def _wilder_trend(highs, lows, closes, period=14):
+    """Return causal Wilder ATR and ADX, seeded with simple averages.
+
+    True range and directional movement start at index 1. The first ATR is at
+    index ``period``; ADX first averages ``period`` DX samples at 2*period-1.
+    A flat series has zero DX/ADX, not an artificial strong trend.
+    """
+    atr, adx = [None] * len(closes), [None] * len(closes)
+    if len(closes) <= period:
+        return atr, adx
+    true_ranges, positive_moves, negative_moves = [], [], []
+    for index in range(1, len(closes)):
+        true_ranges.append(max(highs[index] - lows[index],
+                               abs(highs[index] - closes[index - 1]),
+                               abs(lows[index] - closes[index - 1])))
+        up = highs[index] - highs[index - 1]
+        down = lows[index - 1] - lows[index]
+        positive_moves.append(up if up > down and up > 0 else Decimal(0))
+        negative_moves.append(down if down > up and down > 0 else Decimal(0))
+    average_range = sum(true_ranges[:period], Decimal(0)) / period
+    positive = sum(positive_moves[:period], Decimal(0)) / period
+    negative = sum(negative_moves[:period], Decimal(0)) / period
+    initial_dx = []
+    for index in range(period, len(closes)):
+        if index > period:
+            average_range = (average_range * (period - 1) + true_ranges[index - 1]) / period
+            positive = (positive * (period - 1) + positive_moves[index - 1]) / period
+            negative = (negative * (period - 1) + negative_moves[index - 1]) / period
+        atr[index] = average_range
+        # The shared ATR denominator cancels in the directional DX ratio.
+        dx = (Decimal(100) * abs(positive - negative) / (positive + negative)
+              if positive + negative else Decimal(0))
+        if index < 2 * period:
+            initial_dx.append(dx)
+        if index == 2 * period - 1:
+            adx[index] = sum(initial_dx, Decimal(0)) / period
+        elif index >= 2 * period:
+            adx[index] = (adx[index - 1] * (period - 1) + dx) / period
+    return atr, adx
+
+
+def _trend_breakout_details(candles, closes=None):
+    """Conjunctive long entry filters; trend exits do not await entry filters."""
+    closes = closes if closes is not None else [_number(candle["close"]) for candle in candles]
+    highs = [_number(candle["high"]) for candle in candles]
+    lows = [_number(candle["low"]) for candle in candles]
+    volumes = []
+    for candle in candles:
+        try:
+            volume = Decimal(str(candle.get("volume", "0")))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError("Mum hacmi geçerli bir sayı olmalı.") from exc
+        if not volume.is_finite() or volume < 0:
+            raise ValueError("Mum hacmi negatif olmayan sonlu bir sayı olmalı.")
+        volumes.append(volume)
+    fast, slow = _ema(closes, 20), _ema(closes, 50)
+    atr, adx = _wilder_trend(highs, lows, closes)
+    result = []
+    for index in range(len(candles)):
+        ready = index >= 50  # EMA50 and its preceding value must both exist.
+        decision, checks = "hold", {}
+        if ready:
+            previous_volume = sum(volumes[index - 20:index], Decimal(0)) / 20
+            checks = {
+                "uptrend": closes[index] > fast[index] > slow[index],
+                "rising_ema50": slow[index] > slow[index - 1],
+                "strong_adx": adx[index] >= 25,
+                "prior_high_breakout": closes[index] > max(highs[index - 20:index]),
+                "volume_confirmation": volumes[index] > 0 and volumes[index] > previous_volume,
+                "within_atr_extension": closes[index] - fast[index] <= 2 * atr[index],
+            }
+            if closes[index] < fast[index] or fast[index] < slow[index]:
+                decision = "sell"
+            elif all(checks.values()):
+                decision = "buy"
+        vote = {"buy": 1, "hold": 0, "sell": -1}[decision]
+        result.append({"strategy": "trend_breakout", "signal": decision, "ready": ready,
+                       "votes": {"trend_breakout": vote}, "buy_votes": int(vote > 0),
+                       "sell_votes": int(vote < 0), "entry_checks": checks,
+                       "indicators": {"ema20": str(fast[index]) if fast[index] is not None else None,
+                                      "ema50": str(slow[index]) if slow[index] is not None else None,
+                                      "adx14": str(adx[index]) if adx[index] is not None else None,
+                                      "atr14": str(atr[index]) if atr[index] is not None else None}})
     return result
 
 
@@ -136,8 +226,10 @@ def signals(candles, name):
                 result[index] = "buy"
             elif closes[index] < min(lows[index - 10:index]):
                 result[index] = "sell"
-    else:
+    elif name == "hybrid":
         result = [detail["signal"] for detail in _hybrid_details(candles, closes)]
+    else:
+        result = [detail["signal"] for detail in _trend_breakout_details(candles, closes)]
     return result
 
 
@@ -154,6 +246,11 @@ def signal_details(candles, name="hybrid"):
         return details[-1] if details else {"strategy": name, "signal": "hold", "ready": False,
                                            "votes": {"ema_trend": 0, "rsi": 0, "breakout": 0},
                                            "buy_votes": 0, "sell_votes": 0}
+    if name == "trend_breakout":
+        details = _trend_breakout_details(candles)
+        return details[-1] if details else {"strategy": name, "signal": "hold", "ready": False,
+                                           "votes": {name: 0}, "buy_votes": 0, "sell_votes": 0,
+                                           "entry_checks": {}, "indicators": {}}
     sequence = signals(candles, name)
     decision = sequence[-1] if sequence else "hold"
     vote = {"buy": 1, "hold": 0, "sell": -1}[decision]

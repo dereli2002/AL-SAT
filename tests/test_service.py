@@ -125,7 +125,8 @@ class ServiceTests(unittest.TestCase):
         self.service.feed=DemoMarket()
         report=self.service.test_history(dict(strategy='all',limit=200))
         self.assertTrue(report['is_synthetic'])
-        self.assertEqual(4,len(report['results']))
+        self.assertEqual(5,len(report['results']))
+        self.assertIn('trend_breakout', [result['strategy'] for result in report['results']])
         self.assertTrue(any(int(result['trade_count'])>0 for result in report['results']))
         self.assertEqual('estimate',report['fee_kind'])
         self.assertIsNotNone(self.service.state()['backtest'])
@@ -193,8 +194,69 @@ class ServiceTests(unittest.TestCase):
             self.service.control('start')
         with self.assertRaises(ValueError):
             self.service.control('buy','BTCUSDT','100')
-        self.service.control('clear_emergency')
+        self.service.control('clear_emergency',expected_emergency_revision=closed['emergency']['revision'])
         self.assertFalse(self.service.state()['emergency']['active'])
+        self.assertFalse(self.service.state()['status']['running'])
+
+    def test_delayed_unlock_cannot_clear_a_newer_emergency(self):
+        first=self.service.control('emergency_close')
+        revision=first['emergency']['revision']
+        newer=self.service.control('emergency_close')
+        self.assertEqual(revision+1,newer['emergency']['revision'])
+        with self.assertRaisesRegex(ValueError,'Acil durum değişti'):
+            self.service.control('clear_emergency',expected_emergency_revision=revision)
+        state=self.service.state()
+        self.assertTrue(state['emergency']['active'])
+        self.assertEqual(revision+1,state['emergency']['revision'])
+        self.assertFalse(state['status']['running'])
+        unlocked=self.service.control('clear_emergency',expected_emergency_revision=revision+1)
+        self.assertFalse(unlocked['emergency']['active'])
+        self.assertFalse(unlocked['status']['running'])
+
+    def test_unlock_requires_exact_integer_revision(self):
+        state=self.service.control('emergency_close')
+        revision=state['emergency']['revision']
+        for invalid in (None,True,False,str(revision),float(revision),revision-1,revision+1):
+            with self.subTest(revision=invalid), self.assertRaises(ValueError):
+                self.service.control('clear_emergency',expected_emergency_revision=invalid)
+            self.assertTrue(self.service.state()['emergency']['active'])
+            self.assertEqual(revision,self.service.state()['emergency']['revision'])
+
+    def test_emergency_revision_survives_restart_and_legacy_state_defaults_zero(self):
+        self.assertEqual(0,self.service.state()['emergency']['revision'])
+        self.service.control('emergency_close')
+        self.service.control('emergency_close')
+        self.service.close()
+        self.service=BotService(self.path,feed=self.feed)
+        state=self.service.state()
+        self.assertTrue(state['emergency']['active'])
+        self.assertEqual(2,state['emergency']['revision'])
+        with self.assertRaises(ValueError):
+            self.service.control('clear_emergency',expected_emergency_revision=1)
+        self.service.control('clear_emergency',expected_emergency_revision=2)
+        self.service.close()
+        self.service=BotService(self.path,feed=self.feed)
+        self.assertFalse(self.service.state()['emergency']['active'])
+        self.assertEqual(2,self.service.state()['emergency']['revision'])
+        old_payload=self.service.store.load()
+        del old_payload['emergency_revision']
+        self.service.store.save(old_payload)
+        self.service.close()
+        self.service=BotService(self.path,feed=self.feed)
+        self.assertEqual(0,self.service.state()['emergency']['revision'])
+        self.assertEqual(1,self.service.control('emergency_close')['emergency']['revision'])
+
+    def test_emergency_revision_is_saved_before_liquidation(self):
+        self.enter()
+        def failed_sell(*args,**kwargs):
+            persisted=self.service.store.load()
+            self.assertTrue(persisted['emergency_active'])
+            self.assertEqual(1,persisted['emergency_revision'])
+            raise RuntimeError('liquidation interrupted')
+        with patch.object(self.service.portfolio,'sell',side_effect=failed_sell):
+            with self.assertRaisesRegex(RuntimeError,'liquidation interrupted'):
+                self.service.control('emergency_close')
+        self.assertTrue(self.service.state()['emergency']['active'])
         self.assertFalse(self.service.state()['status']['running'])
 
     def test_emergency_without_quotes_is_persisted_and_exits_when_prices_return(self):
@@ -210,7 +272,7 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(self.service.state()['emergency']['active'])
         self.assertEqual(1,len(self.service.state()['positions']))
         with self.assertRaises(ValueError):
-            self.service.control('clear_emergency')
+            self.service.control('clear_emergency',expected_emergency_revision=state['emergency']['revision'])
         self.feed.fail=False
         self.service.step()
         state=self.service.state()
@@ -426,6 +488,37 @@ class ServiceTests(unittest.TestCase):
 
 
 class HttpTests(unittest.TestCase):
+    def test_emergency_unlock_http_checks_latest_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service=BotService(Path(directory)/'db.sqlite3',feed=Feed())
+            server=ThreadingHTTPServer(('127.0.0.1',0),partial(Handler,service=service))
+            worker=threading.Thread(target=server.serve_forever,daemon=True)
+            worker.start()
+            endpoint='http://127.0.0.1:'+str(server.server_port)+'/api/control'
+            def post(payload):
+                request=Request(endpoint,data=json.dumps(payload).encode(),method='POST',
+                                headers={'Content-Type':'application/json'})
+                with urlopen(request) as result:
+                    return json.load(result)
+            try:
+                first=post(dict(action='emergency_close'))
+                latest=post(dict(action='emergency_close'))
+                for payload in (dict(action='clear_emergency'),
+                                dict(action='clear_emergency',expected_emergency_revision=True),
+                                dict(action='clear_emergency',expected_emergency_revision=first['emergency']['revision'])):
+                    with self.subTest(payload=payload),self.assertRaises(HTTPError) as caught:
+                        post(payload)
+                    self.assertEqual(400,caught.exception.code)
+                    self.assertTrue(service.state()['emergency']['active'])
+                cleared=post(dict(action='clear_emergency',expected_emergency_revision=latest['emergency']['revision']))
+                self.assertFalse(cleared['emergency']['active'])
+                self.assertFalse(cleared['status']['running'])
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join()
+                service.close()
+
     def test_dashboard_api_validation_and_origin(self):
         with tempfile.TemporaryDirectory() as directory:
             service=BotService(Path(directory)/'db.sqlite3',feed=Feed())
@@ -436,6 +529,12 @@ class HttpTests(unittest.TestCase):
             try:
                 with urlopen(base+'/api/state') as result:
                     self.assertEqual('estimate',json.load(result)['fee_info']['kind'])
+                for path, expected in (('/positions.html',b'id="positionsGrid"'),
+                                       ('/positions.js',b'close_position'),
+                                       ('/positions.css',b'.positions-grid')):
+                    with self.subTest(path=path), urlopen(base+path) as result:
+                        self.assertEqual(200,result.status)
+                        self.assertIn(expected,result.read())
                 with urlopen(base+'/api/symbols') as result:
                     self.assertEqual(3,len(json.load(result)['symbols']))
                 with urlopen(base+'/api/chart?symbol=ETHUSDT&interval=5m') as result:

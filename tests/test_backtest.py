@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from bot.backtest import compare_strategies, run_backtest
 from bot.core import PaperBroker
-from bot.strategies import STRATEGIES, signal_details, signals
+from bot.strategies import STRATEGIES, _wilder_trend, signal_details, signals
 
 
 def config(**overrides):
@@ -44,6 +44,18 @@ def candles(prices=None, count=60):
             "volume": "10",
         })
     return result
+
+
+def trend_candles(count=70, jump="1.1"):
+    """Established, moderate uptrend with a volume-confirmed final breakout."""
+    history = candles([str(Decimal(100) + Decimal("0.1") * index) for index in range(count)])
+    for candle in history:
+        price = Decimal(candle["close"])
+        candle.update(high=str(price + 1), low=str(price - 1))
+    price = Decimal(history[-1]["close"]) + Decimal(jump)
+    history[-1].update(open=str(price), high=str(price + 1), low=str(price - 1),
+                       close=str(price), volume="11")
+    return history
 
 
 class StrategyTests(unittest.TestCase):
@@ -109,6 +121,118 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(details["buy_votes"], 1)
         self.assertEqual(details["signal"], "hold")
 
+    def test_wilder_atr_adx_seeds_and_flat_trend(self):
+        closes = [Decimal(100 + index) for index in range(35)]
+        highs, lows = [price + 1 for price in closes], [price - 1 for price in closes]
+        atr, adx = _wilder_trend(highs, lows, closes)
+        self.assertTrue(all(value is None for value in atr[:14]))
+        self.assertEqual(atr[14:], [Decimal(2)] * 21)
+        self.assertTrue(all(value is None for value in adx[:27]))
+        self.assertEqual(adx[27:], [Decimal(100)] * 8)
+        flat = [Decimal(100)] * 35
+        flat_atr, flat_adx = _wilder_trend(flat, flat, flat)
+        self.assertEqual(flat_atr[14:], [Decimal(0)] * 21)
+        self.assertEqual(flat_adx[27:], [Decimal(0)] * 8)
+
+    def test_wilder_smoothing_uses_averaged_directional_movement_and_gap_range(self):
+        closes = [Decimal(value) for value in (100, 101, 102, 103, 102, 101, 100)]
+        _, adx = _wilder_trend([price + 1 for price in closes],
+                               [price - 1 for price in closes], closes, period=3)
+        # DX at indices 3,4,5 is 100,100/3,100/9. The ADX seed is
+        # their average; the next DX is 1100/27 after another down move.
+        self.assertAlmostEqual(adx[5], Decimal(1300) / 27, places=20)
+        self.assertAlmostEqual(adx[6], Decimal(3700) / 81, places=20)
+        gap = [Decimal(value) for value in (100, 101, 102, 103, 107)]
+        atr, _ = _wilder_trend([price + 1 for price in gap],
+                              [price - 1 for price in gap], gap, period=3)
+        self.assertEqual(atr[3], 2)
+        self.assertEqual(atr[4], 3)  # (2*2 + gap true range 5)/3.
+
+    def test_trend_breakout_requires_51_candles_and_all_entry_filters(self):
+        history = trend_candles()
+        for count in (0, 1, 14, 27, 49, 50):
+            with self.subTest(candles=count):
+                details = signal_details(history[:count], "trend_breakout")
+                self.assertFalse(details["ready"])
+                self.assertEqual(details["signal"], "hold")
+        first_ready = signal_details(trend_candles(51), "trend_breakout")
+        self.assertTrue(first_ready["ready"])
+        self.assertEqual(first_ready["signal"], "buy")
+        details = signal_details(history, "trend_breakout")
+        self.assertEqual(details["signal"], "buy")
+        self.assertTrue(all(details["entry_checks"].values()))
+        self.assertEqual(Decimal(details["indicators"]["adx14"]), 100)
+        self.assertEqual(signals(history, "trend_breakout")[-1], "buy")
+
+    def test_trend_breakout_requires_real_volume_confirmation(self):
+        for volume in ("10", "0", None):
+            with self.subTest(volume=volume):
+                history = trend_candles()
+                if volume is None:
+                    history[-1].pop("volume")
+                else:
+                    history[-1]["volume"] = volume
+                details = signal_details(history, "trend_breakout")
+                self.assertFalse(details["entry_checks"]["volume_confirmation"])
+                self.assertEqual(details["signal"], "hold")
+        # The exact previous 20 candles include this older spike; replacing
+        # that window with the current candle must not lower the threshold.
+        history = trend_candles()
+        history[-21]["volume"] = "50"
+        self.assertEqual(signals(history, "trend_breakout")[-1], "hold")
+        history[-21]["volume"] = "10"
+        history[-22]["volume"] = "50"  # Outside the reference window.
+        self.assertEqual(signals(history, "trend_breakout")[-1], "buy")
+        for volume in ("-1", "NaN", "Infinity", "invalid"):
+            with self.subTest(invalid_volume=volume):
+                history[-1]["volume"] = volume
+                with self.assertRaises(ValueError):
+                    signals(history, "trend_breakout")
+
+    def test_trend_breakout_rejects_equal_high_and_excessive_atr_extension(self):
+        history = trend_candles(jump="0.9")  # Equal to the preceding high.
+        details = signal_details(history, "trend_breakout")
+        self.assertFalse(details["entry_checks"]["prior_high_breakout"])
+        self.assertEqual(details["signal"], "hold")
+        history = trend_candles(jump="20")
+        details = signal_details(history, "trend_breakout")
+        self.assertTrue(details["entry_checks"]["prior_high_breakout"])
+        self.assertFalse(details["entry_checks"]["within_atr_extension"])
+        self.assertEqual(details["signal"], "hold")
+
+    def test_trend_breakout_blocks_flat_and_weak_new_trends_and_falling_market(self):
+        flat = candles(count=70)
+        self.assertEqual(signals(flat, "trend_breakout")[-1], "hold")
+        # A single spike after a flat period has ADX below 25 despite a
+        # rising EMA and a breakout; it must not be mistaken for strong trend.
+        weak = candles(["100"] * 69 + ["102"])
+        weak[-1]["volume"] = "11"
+        details = signal_details(weak, "trend_breakout")
+        self.assertFalse(details["entry_checks"]["strong_adx"])
+        self.assertEqual(details["signal"], "hold")
+        falling = candles([str(200 - index) for index in range(70)])
+        self.assertNotIn("buy", signals(falling, "trend_breakout"))
+        self.assertEqual(signals(falling, "trend_breakout")[-1], "sell")
+
+    def test_trend_breakout_exit_does_not_require_volume_or_strong_adx(self):
+        history = trend_candles()
+        history[-1].update(open="100", high="101", low="99", close="100", volume="0")
+        details = signal_details(history, "trend_breakout")
+        self.assertFalse(details["entry_checks"]["volume_confirmation"])
+        self.assertEqual(details["signal"], "sell")
+
+    def test_future_collapse_does_not_change_confirmed_trend_breakout(self):
+        observation = trend_candles()
+        history = candles([row["close"] for row in observation] + ["1"] * 20)
+        for index, row in enumerate(observation):
+            history[index].update({key: row[key] for key in ("open", "high", "low", "close", "volume")})
+        full = signals(history, "trend_breakout")
+        self.assertEqual(full[69], "buy")
+        self.assertEqual(full[:70], signals(observation, "trend_breakout"))
+        for end in (28, 50, 51, 68, 69):
+            with self.subTest(end=end):
+                self.assertEqual(full[:end], signals(history[:end], "trend_breakout"))
+
 
 class BacktestTests(unittest.TestCase):
     def test_signal_fills_at_next_open_and_training_never_trades(self):
@@ -172,7 +296,7 @@ class BacktestTests(unittest.TestCase):
         history, settings = candles(), config()
         original = copy.deepcopy((history, settings))
         result = compare_strategies(history, settings)
-        self.assertEqual(len(result["results"]), 4)
+        self.assertEqual(len(result["results"]), 5)
         self.assertEqual([row["strategy"] for row in result["results"]], list(STRATEGIES))
         self.assertTrue(all(row["test_start"] == result["test_start"] for row in result["results"]))
         self.assertEqual(len({row["hold_return_pct"] for row in result["results"]}), 1)
@@ -196,6 +320,24 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(Decimal(result["final_equity"]), Decimal(expected.snapshot("103")["equity"]))
         self.assertLess(Decimal(result["net_pnl"]), 0)  # Flat fills still pay costs.
         self.assertTrue(any("Karma strateji" in note for note in result["notes"]))
+
+    def test_real_trend_breakout_fills_next_open_and_pays_all_costs(self):
+        observation = trend_candles()
+        history = candles([row["close"] for row in observation] + ["108"] * 30)
+        for index, row in enumerate(observation):
+            history[index].update({key: row[key] for key in ("open", "high", "low", "close", "volume")})
+        self.assertEqual(signals(history, "trend_breakout")[69], "buy")
+        result = run_backtest(history, config(), "trend_breakout")
+        expected = PaperBroker(config())
+        expected.buy("108", history[70]["open_time"])
+        expected.sell("108", history[-1]["close_time"])
+        self.assertEqual(result["strategy"], "trend_breakout")
+        self.assertEqual(result["strategy_name"], "ADX filtreli trend kırılımı")
+        self.assertEqual(result["trade_count"], 1)
+        self.assertEqual(result["trades"][0]["opened_at"], history[70]["open_time"].replace("+00:00", "Z"))
+        self.assertEqual(Decimal(result["final_equity"]), Decimal(expected.snapshot("108")["equity"]))
+        self.assertGreater(Decimal(result["fees_paid"]), 0)
+        self.assertLess(Decimal(result["net_pnl"]), 0)
 
     def test_invalid_ohlc_or_overlapping_candles_are_rejected(self):
         bad = candles()

@@ -186,7 +186,7 @@ def run_backtest(candles, config, strategy="ema_cross"):
 
 
 def compare_strategies(candles, config):
-    """Compare all four candidates on identical candles, capital and costs."""
+    """Compare all registered candidates on identical candles, capital and costs."""
     candles = _validated(candles)
     return {
         "results": [_run(candles, config, strategy) for strategy in STRATEGIES],

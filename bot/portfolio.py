@@ -397,6 +397,7 @@ class PaperPortfolio:
         with localcontext() as context:
             context.prec = 28
             positions, missing, unrealized, equity = [], [], ZERO, self._state["cash"]
+            open_entry_cost = ZERO
             for symbol in self.position_symbols:
                 saved = self._state["brokers"][symbol]
                 price = fresh.get(symbol, self._state["last_prices"].get(symbol, saved["position"]["entry_price"]))
@@ -408,6 +409,7 @@ class PaperPortfolio:
                             "net_value": child["equity"], "quote_missing": symbol not in fresh}
                 positions.append(position)
                 unrealized += profit
+                open_entry_cost += entry_cost
                 equity += Decimal(child["equity"])
                 if symbol not in fresh:
                     missing.append(symbol)
@@ -416,6 +418,8 @@ class PaperPortfolio:
             return _json(dict(
                 mode="paper", initial_cash=self._state["initial_cash"], cash=self._state["cash"],
                 equity=equity, realized_pnl=self._state["realized_pnl"], unrealized_pnl=unrealized,
+                open_entry_cost=open_entry_cost,
+                unrealized_pnl_pct=unrealized / open_entry_cost * HUNDRED if open_entry_cost else ZERO,
                 total_pnl=total, total_pnl_pct=total / self._state["initial_cash"] * HUNDRED,
                 fees_paid=self._state["fees_paid"], trade_count=len(self._state["trades"]),
                 win_count=sum(Decimal(trade["pnl_quote"]) > 0 for trade in self._state["trades"]),

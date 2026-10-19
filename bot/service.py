@@ -88,6 +88,7 @@ class BotService:
         self.last_candles=saved.get('last_candles',{}) if saved else {}
         self.running=False
         self.emergency_active=bool(saved.get('emergency_active',False)) if saved else False
+        self.emergency_revision=saved.get('emergency_revision',0) if saved else 0
         self._manual_overrides=saved.get('manual_overrides',{}) if saved else {}
         self.error=None
         self.backtest=saved.get('backtest') if saved else None
@@ -128,7 +129,8 @@ class BotService:
     def _save(self,events=()):
         self.store.save(dict(version=2,config=self.config,portfolio=self.portfolio.export_state(),
                              last_candles=self.last_candles,backtest=self.backtest,
-                             emergency_active=self.emergency_active,manual_overrides=self._manual_overrides),events)
+                             emergency_active=self.emergency_active,emergency_revision=self.emergency_revision,
+                             manual_overrides=self._manual_overrides),events)
 
     def start_worker(self):
         if self._worker is None:
@@ -402,7 +404,7 @@ class BotService:
                                      last_symbol=self._last_symbol,last_scan_at=self._last_scan_at,batch_size=SCAN_BATCH_SIZE,
                                      pending_scans=len(self._pending),errors=self._scan_errors,mode=self.config['universe_mode'],
                                      warning=self._catalog_warning),
-                        emergency=dict(active=self.emergency_active,
+                        emergency=dict(active=self.emergency_active,revision=self.emergency_revision,
                                        pending_symbols=list(self.portfolio.position_symbols) if self.emergency_active else [],
                                        last_error=self.error if self.emergency_active and self.portfolio.position_symbols else None),
                         fee_info=dict(kind='estimate',source='user_config',description='Komisyonlar kullanıcı tahminidir; Binance hesabının güncel oranı API ile doğrulanmadı.'))
@@ -458,7 +460,7 @@ class BotService:
             self._save()
         return self.state()
 
-    def control(self,action,symbol=None,amount=None):
+    def control(self,action,symbol=None,amount=None,expected_emergency_revision=None):
         prepared_filters=None
         if action=='buy':
             with self.lock:
@@ -486,6 +488,7 @@ class BotService:
                 # Persist the kill switch BEFORE any quote-dependent liquidation.
                 self.running=False
                 self.emergency_active=True
+                self.emergency_revision+=1
                 self._save()
                 if fresh:
                     for target in list(self.portfolio.position_symbols):
@@ -493,6 +496,11 @@ class BotService:
                             events+=self.portfolio.sell(target,self._prices[target],now,
                                                         reason='emergency_close',prices=self._prices)
             elif action=='clear_emergency':
+                # An older tab/request must never unlock a newer emergency.
+                # Check the persisted revision under the same lock as the latch.
+                if (type(expected_emergency_revision) is not int
+                        or expected_emergency_revision!=self.emergency_revision):
+                    raise ValueError('Acil durum değişti veya sürümü eksik; güncel durumu yenileyip kilidi tekrar kaldırın.')
                 if self.portfolio.position_symbols:
                     raise ValueError('Acil kilidi kaldırmak için tüm bekleyen pozisyonların kapanması gerekli.')
                 self.emergency_active=False
