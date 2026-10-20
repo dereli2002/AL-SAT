@@ -13,7 +13,7 @@ import time
 from .core import DEFAULT_CONFIG, normalize_config
 from .portfolio import PaperPortfolio
 from .market import BinanceMarket, DemoMarket, INTERVALS, CHART_INTERVALS, valid_market, valid_chart
-from .strategies import STRATEGIES, signals, signal_details
+from .strategies import STRATEGIES, entry_signal_details
 from .backtest import compare_strategies, run_backtest
 
 APP_DEFAULTS = dict(symbol='BTCUSDT', symbols=['BTCUSDT','ETHUSDT','SOLUSDT'],
@@ -312,8 +312,9 @@ class BotService:
                         updated_at=self._quote_time,trends=output)
 
     @staticmethod
-    def _scan(feed,symbol,interval):
-        bars=feed.candles(symbol,interval,100)
+    def _scan(feed,symbol,interval,strategy=None):
+        limit=100 + 86400//INTERVALS[interval]
+        bars=feed.candles(symbol,interval,limit)
         if len(bars)<60:
             raise ValueError('Sinyal için en az 60 kapanmış mum gerekli.')
         if isinstance(feed,BinanceMarket):
@@ -332,8 +333,8 @@ class BotService:
             try:
                 sample=future.result()
                 bars=sample['bars']
-                self._remember_chart(symbol,config['interval'],bars)
-                details=signal_details(bars,config['strategy'])
+                self._remember_chart(symbol,config['interval'],bars[-100:])
+                details=entry_signal_details(bars[-100:],config['strategy'],context_candles=bars[:-100])
                 self._cache[symbol]=dict(candle=bars[-1]['close_time'],signal=details['signal'],
                                          details=details,filters=sample['filters'])
                 self._last_symbol=symbol
@@ -362,7 +363,7 @@ class BotService:
                 break
             if symbol in self._pending or self._next_due.get(symbol,0)>now:
                 continue
-            self._pending[symbol]=(self._generation,self._executor.submit(self._scan,feed,symbol,config['interval']))
+            self._pending[symbol]=(self._generation,self._executor.submit(self._scan,feed,symbol,config['interval'],config['strategy']))
             if symbol in self._universe:
                 self._cursor=(self._universe.index(symbol)+1)%len(self._universe)
 
@@ -654,20 +655,28 @@ class BotService:
             generation,feed=self._generation,self.feed
         symbol,interval=payload.get('symbol',config['symbol']),payload.get('interval',config['interval'])
         valid_market(symbol,interval)
-        limit=int(payload.get('limit',500))
+        raw_limit=payload.get('limit',500)
+        if isinstance(raw_limit,bool) or not isinstance(raw_limit,(str,int)) or not str(raw_limit).isdigit():
+            raise ValueError('Geçmiş test mum sayısı 100–1000 arasında tam sayı olmalı.')
+        limit=int(raw_limit)
+        if not 100<=limit<=1000:
+            raise ValueError('Geçmiş test mum sayısı 100–1000 arasında olmalı.')
         strategy=payload.get('strategy','all')
         if strategy not in tuple(STRATEGIES)+('all',):
             raise ValueError('Geçersiz strateji.')
         try:
-            bars=feed.candles(symbol,interval,limit)
+            history_limit=limit + 86400//INTERVALS[interval]
+            history=feed.candles(symbol,interval,history_limit)
+            bars=history[-limit:]
+            context=history[:-limit]
             config.update(feed.filters(symbol))
         except Exception as exc:
             self._record_throttle(exc)
             raise
         if strategy=='all':
-            report=compare_strategies(bars,config)
+            report=compare_strategies(bars,config,context_candles=context)
         else:
-            result=run_backtest(bars,config,strategy)
+            result=run_backtest(bars,config,strategy,context_candles=context)
             report=dict(results=[result],train_candles=int(len(bars)*.7),test_candles=len(bars)-int(len(bars)*.7),notes=result.get('notes',[]))
         report.update(data_source=config['data_source'],is_synthetic=feed.is_synthetic,symbol=symbol,interval=interval,
                       fee_kind='estimate',generated_at=datetime.now(timezone.utc).isoformat())

@@ -250,7 +250,7 @@ class BacktestTests(unittest.TestCase):
         expected = PaperBroker(settings)
         expected.buy("101", history[split]["open_time"])
         expected.sell("110", history[split + 1]["open_time"])
-        with patch("bot.backtest.signals", return_value=generated):
+        with patch("bot.backtest.entry_signals", return_value=generated):
             result = run_backtest(history, settings)
         self.assertEqual(result["trade_count"], 1)
         self.assertEqual(Decimal(result["final_equity"]), Decimal(expected.snapshot("110")["equity"]))
@@ -266,7 +266,7 @@ class BacktestTests(unittest.TestCase):
         expected = PaperBroker(settings)
         expected.buy("100", history[42]["open_time"])
         expected.sell("100", history[-1]["close_time"])
-        with patch("bot.backtest.signals", return_value=generated):
+        with patch("bot.backtest.entry_signals", return_value=generated):
             result = run_backtest(history, settings)
         self.assertEqual(result["trade_count"], 1)
         self.assertLess(Decimal(result["net_return_pct"]), 0)
@@ -283,7 +283,7 @@ class BacktestTests(unittest.TestCase):
         expected = PaperBroker(settings)
         expected.buy("100", history[42]["open_time"])
         expected.sell("90", history[42]["close_time"])
-        with patch("bot.backtest.signals", return_value=generated):
+        with patch("bot.backtest.entry_signals", return_value=generated):
             result = run_backtest(history, settings)
         # high→low activates a trailing stop before the low. It fills at the
         # observed 90 with slippage, not at the more favorable old stop level.
@@ -296,7 +296,7 @@ class BacktestTests(unittest.TestCase):
         history, settings = candles(), config()
         original = copy.deepcopy((history, settings))
         result = compare_strategies(history, settings)
-        self.assertEqual(len(result["results"]), 5)
+        self.assertEqual(len(result["results"]), len(STRATEGIES))
         self.assertEqual([row["strategy"] for row in result["results"]], list(STRATEGIES))
         self.assertTrue(all(row["test_start"] == result["test_start"] for row in result["results"]))
         self.assertEqual(len({row["hold_return_pct"] for row in result["results"]}), 1)
@@ -307,6 +307,9 @@ class BacktestTests(unittest.TestCase):
         # Only the final observation candle breaks above 20 prior highs while
         # EMA is rising and RSI stays neutral. No indicator or signal is mocked.
         history = candles(["100", "101"] * 34 + ["100", "102"] + ["103"] * 30)
+        for row in history:
+            row["volume"] = str(Decimal(row["volume"]) * 1000)
+            row["quote_volume"] = str(Decimal(row["close"]) * Decimal(row["volume"]))
         self.assertEqual(signals(history, "hybrid")[69], "buy")
         result = run_backtest(history, config(), "hybrid")
         expected = PaperBroker(config())
@@ -326,6 +329,9 @@ class BacktestTests(unittest.TestCase):
         history = candles([row["close"] for row in observation] + ["108"] * 30)
         for index, row in enumerate(observation):
             history[index].update({key: row[key] for key in ("open", "high", "low", "close", "volume")})
+        for row in history:
+            row["volume"] = str(Decimal(row["volume"]) * 1000)
+            row["quote_volume"] = str(Decimal(row["close"]) * Decimal(row["volume"]))
         self.assertEqual(signals(history, "trend_breakout")[69], "buy")
         result = run_backtest(history, config(), "trend_breakout")
         expected = PaperBroker(config())

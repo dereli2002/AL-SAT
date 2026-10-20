@@ -388,6 +388,84 @@ class DemoMarketTests(unittest.TestCase):
 
 
 class DisplayCandleTests(unittest.TestCase):
+    def test_long_strategy_history_pages_closed_candles_without_changing_chart_limit(self):
+        instant=datetime(2026,1,2,12,0,30,tzinfo=timezone.utc)
+        minute=int(instant.timestamp())//60*60000
+        rows=[[minute-index*60000,'100','102','99','101','10',minute-(index-1)*60000-1,str(index)+'.12']
+              for index in range(1600,-1,-1)]
+        calls=[]
+        def api(path,params):
+            calls.append((path,dict(params)))
+            eligible=[row for row in rows if row[6]<=params['endTime']]
+            return eligible[-params['limit']:]
+        market=BinanceMarket()
+        with patch.object(market,'_get',side_effect=api),patch('bot.market.datetime') as clock:
+            clock.now.return_value=instant
+            clock.fromtimestamp.side_effect=datetime.fromtimestamp
+            result=market.candles('BTCUSDT','1m',1540)
+            with self.assertRaises(ValueError):
+                market.chart_candles('BTCUSDT','1m',1540)
+        self.assertEqual(1540,len(result))
+        self.assertEqual([1000,540],[params['limit'] for _,params in calls])
+        self.assertEqual(minute-1,calls[0][1]['endTime'])
+        self.assertEqual(minute-1000*60000-1,calls[1][1]['endTime'])
+        self.assertEqual(datetime.fromtimestamp((minute-1540*60000)/1000,timezone.utc),
+                         datetime.fromisoformat(result[0]['open_time']))
+        self.assertEqual(datetime.fromtimestamp((minute-1)/1000,timezone.utc),
+                         datetime.fromisoformat(result[-1]['close_time']))
+        self.assertEqual(1540,len({row['open_time'] for row in result}))
+        self.assertEqual('1540.12',result[0]['quote_volume'])
+        self.assertEqual('1.12',result[-1]['quote_volume'])
+
+    def test_exchange_quote_volume_is_preserved_exactly_and_never_invented(self):
+        instant=datetime(2026,1,2,12,tzinfo=timezone.utc)
+        epoch=int(instant.timestamp()*1000)
+        rows=[[epoch-120000,'1','3','.5','2','10',epoch-60001,'123456.7890123456789'],
+              [epoch-60000,'1','3','.5','2','10',epoch-1]]
+        market=BinanceMarket()
+        with patch.object(market,'_get',return_value=rows),patch('bot.market.datetime') as clock:
+            clock.now.return_value=instant
+            clock.fromtimestamp.side_effect=datetime.fromtimestamp
+            result=market.candles('BTCUSDT','1m',100)
+        self.assertEqual('123456.7890123456789',result[0]['quote_volume'])
+        self.assertNotIn('quote_volume',result[1])
+
+    def test_invalid_exchange_quote_volume_is_unknown_for_single_and_paged_history(self):
+        instant=datetime(2026,1,2,12,tzinfo=timezone.utc)
+        epoch=int(instant.timestamp()*1000)
+        for limit in (100,1540):
+            for volume in ('NaN','Infinity','-1','not-a-number',None):
+                row=[epoch-60000,'1','3','.5','2','10',epoch-1,volume]
+                market=BinanceMarket()
+                with self.subTest(limit=limit,volume=volume),patch.object(market,'_get',return_value=[row]),patch('bot.market.datetime') as clock:
+                    clock.now.return_value=instant
+                    clock.fromtimestamp.side_effect=datetime.fromtimestamp
+                    result=market.candles('BTCUSDT','1m',limit)
+                    self.assertEqual(1,len(result))
+                    self.assertIsNone(result[0]['quote_volume'])
+                    self.assertEqual('2',result[0]['close'])
+
+    def test_paged_strategy_history_rejects_overlap_future_or_unordered_response(self):
+        instant=datetime(2026,1,2,12,tzinfo=timezone.utc)
+        epoch=int(instant.timestamp()*1000)
+        valid=[epoch-60000,'1','3','.5','2','10',epoch-1]
+        for rows in ([valid,valid], [[epoch,'1','3','.5','2','10',epoch+59999]]):
+            market=BinanceMarket()
+            with self.subTest(rows=rows),patch.object(market,'_get',return_value=rows),patch('bot.market.datetime') as clock:
+                clock.now.return_value=instant
+                clock.fromtimestamp.side_effect=datetime.fromtimestamp
+                with self.assertRaises(ValueError):
+                    market.candles('BTCUSDT','1m',1540)
+
+    def test_demo_extended_history_preserves_the_requested_suffix(self):
+        market=DemoMarket()
+        extended=market.candles('BTCUSDT','1m',1940)
+        self.assertEqual(1940,len(extended))
+        self.assertEqual(market.candles('BTCUSDT','1m',500),extended[-500:])
+        self.assertTrue(all(Decimal(row['quote_volume'])>0 for row in extended))
+        with self.assertRaises(ValueError):
+            market.chart_candles('BTCUSDT','1m',1940)
+
     def test_second_interval_is_display_only(self):
         valid_chart('BTCUSDT', '1s')
         with self.assertRaises(ValueError):

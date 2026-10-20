@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from .core import DEFAULT_CONFIG, PaperBroker
-from .strategies import STRATEGIES, signals
+from .strategies import STRATEGIES, entry_signals
 
 
 NOTES = [
@@ -50,8 +50,8 @@ def _string(value):
     return result or "0"
 
 
-def _validated(candles):
-    if len(candles) < 40:
+def _validated(candles, minimum=40):
+    if len(candles) < minimum:
         raise ValueError("Isınma ve örneklem dışı test için en az 40 kapanmış mum gerekli.")
     normalized = []
     previous_close = None
@@ -70,7 +70,15 @@ def _validated(candles):
             raise ValueError("Mum fiyatları pozitif, hacim negatif olmayan değerler olmalı.")
         if values["low"] > min(values["open"], values["close"]) or values["high"] < max(values["open"], values["close"]) or values["low"] > values["high"]:
             raise ValueError("Mumun yüksek/düşük fiyatları açılış ve kapanışı kapsamalı.")
-        normalized.append({**{key: _string(value) for key, value in values.items()}, "volume": _string(volume), "open_time": _iso(start), "close_time": _iso(end)})
+        candle = {**{key: _string(value) for key, value in values.items()}, "volume": _string(volume), "open_time": _iso(start), "close_time": _iso(end)}
+        if 'quote_volume' in source:
+            try:
+                quote_volume = _decimal(source['quote_volume'], 'quote_volume')
+            except ValueError:
+                quote_volume = None
+            candle['quote_volume'] = (_string(quote_volume)
+                                      if quote_volume is not None and quote_volume >= 0 else None)
+        normalized.append(candle)
         previous_close = end
     return normalized
 
@@ -114,11 +122,30 @@ def _simulate_path(config, state, candle, first, second):
     return equity, broker, samples, events
 
 
-def _run(candles, config, strategy):
+def _context(candles, context_candles):
+    context = _validated(context_candles, minimum=0)
+    if context and _time(context[-1]['close_time']) >= _time(candles[0]['open_time']):
+        raise ValueError('Gösterge ön geçmişi test mumlarından önce gelmeli ve çakışmamalı.')
+    return context
+
+
+def _strategy_notes(strategies, context_count=0):
+    notes = [STRATEGIES[name]['name'] + ': ' + STRATEGIES[name]['description']
+             for name in strategies if name in ('hybrid', 'rsi_band', 'vwap_ema', 'scalping')]
+    notes.append('Tüm stratejilerde önceki ' + str(context_count) + ' mum son 24 saatin kapanmış mum USDT hacmi hesabına ön geçmiş sağlar; test penceresi ile %70/%30 ayrımı değişmez. Tam 24 saatlik kesintisiz veri ve borsadan gelen USDT hacmi yoksa veya toplam 10 milyon USDT altındaysa yeni alış bekler. Satış ve koruyucu stoplar bu filtreden bağımsızdır. USDT, dolar hacmi için yaklaşık karşılıktır.')
+    if 'vwap_ema' in strategies:
+        notes.append('WAP EMA ön geçmişi günlük UTC VWAP göstergesini de ısıtır; gün başlangıcı eksikse ya da seans verisi kopuksa WAP sinyali bekler.')
+    return notes
+
+
+def _run(candles, config, strategy, context_candles=()):
     if strategy not in STRATEGIES:
         raise ValueError("Bilinmeyen strateji: " + str(strategy))
     split = _split(candles)
-    sequence = signals(candles, strategy)
+    # Session/volume prefixes only supply indicator history. They never expand
+    # the requested window, changes the 70/30 split, or places earlier trades.
+    context = list(context_candles)
+    sequence = entry_signals(candles, strategy, context_candles=context)
     broker = PaperBroker(config)
     initial_cash = _decimal(broker.snapshot(candles[split]["open"])["equity"])
     if initial_cash <= 0:
@@ -171,26 +198,29 @@ def _run(candles, config, strategy):
         "initial_cash": _string(initial_cash),
         "final_equity": str(final["equity"]),
         "fee_assumption": _fee_assumption(config),
+        "context_candles": len(context),
         "intrabar_paths": paths,
         "trades": final.get("trades", []),
         "events": events,
         "equity_curve": curve,
         **_metadata(candles, split),
-        "notes": list(NOTES) + (["Karma strateji: " + STRATEGIES[strategy]["description"]] if strategy == "hybrid" else []),
+        "notes": list(NOTES) + _strategy_notes([strategy], len(context)),
     }
 
 
-def run_backtest(candles, config, strategy="ema_cross"):
+def run_backtest(candles, config, strategy="ema_cross", context_candles=()):
     """Evaluate one fixed strategy only in the final 30% of validated candles."""
-    return _run(_validated(candles), config, strategy)
+    candles = _validated(candles)
+    return _run(candles, config, strategy, _context(candles, context_candles))
 
 
-def compare_strategies(candles, config):
+def compare_strategies(candles, config, context_candles=()):
     """Compare all registered candidates on identical candles, capital and costs."""
     candles = _validated(candles)
+    context = _context(candles, context_candles)
     return {
-        "results": [_run(candles, config, strategy) for strategy in STRATEGIES],
+        "results": [_run(candles, config, strategy, context) for strategy in STRATEGIES],
         **_metadata(candles, _split(candles)),
         "fee_assumption": _fee_assumption(config),
-        "notes": list(NOTES) + ["Karma strateji: " + STRATEGIES["hybrid"]["description"]],
+        "notes": list(NOTES) + _strategy_notes(STRATEGIES, len(context)),
     }

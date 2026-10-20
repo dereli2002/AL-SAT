@@ -8,6 +8,9 @@ const strategies = {
   rsi_reversion: { name: 'RSI dönüşü', description: 'RSI 14 ≤ 30 olduğunda alış, ≥ 60 olduğunda satış arar. Düşük RSI tek başına yükseliş onayı değildir.' },
   breakout: { name: 'Fiyat kırılımı', description: 'Önceki fiyat aralığının üzerindeki kırılımı izler.' },
   trend_breakout: { name: 'ADX filtreli trend kırılımı', description: 'EMA 20/50 yükselişi, ADX ≥ 25 ve hacim onaylı kırılım arar. ATR filtresi aşırı uzaklaşmış fiyatları eler; uygun koşul yoksa bekler.' },
+  rsi_band: { name: 'RSI BANT', description: 'Bollinger (20, 2) alt bandına temasla aynı kapanmış mumda Stochastic RSI (14, 14, 3, 3) K çizgisi 20 üstüne geçerse al; üst banda temas ve K çizgisinin 80 altına geçişinde sat.' },
+  vwap_ema: { name: 'WAP EMA', description: 'Kapanış EMA9 ve günlük VWAP çizgilerinin ikisinin de üstüne geçerse al; ikisinin de altına geçerse sat. 1 veya 5 dakikalık mumlar için; VWAP Türkiye saatiyle 03.00’te sıfırlanır.' },
+  scalping: { name: 'SCALPİNG', description: 'Kapanış EMA20 üstünde ve CMF20 pozitifken Stochastic RSI K, D çizgisini ikisi de 20 altında yukarı keserse al. Çıkışlar mevcut stop, kâr takibi veya manuel SAT ile yönetilir.' },
 };
 const reasonNames = { stop_loss: 'Alış altı stop', fixed_stop: 'Alış altı stop', trailing_stop: 'Kâr takibi stop', trailing_price: 'Fiyat takibi stop', trailing_profit: 'Net kâr takibi', strategy: 'Strateji sinyali', signal: 'Strateji sinyali', sell_signal: 'Satış sinyali', manual: 'Manuel', manual_buy: 'Manuel alış', manual_sell: 'Manuel satış', manual_close: 'Manuel kapatma', emergency: 'Acil kapatma', emergency_close: 'Acil kapatma', daily_loss: 'Günlük risk limiti', daily_loss_limit: 'Günlük risk limiti', end_of_test: 'Test sonu', backtest_end: 'Test sonu' };
 const formatNumber = new Intl.NumberFormat('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -46,6 +49,7 @@ let catalogueError = '';
 let chartPicker = null;
 let manualPicker = null;
 let mainCandleChart = null;
+let btcCornerChart = null;
 let displayInterval = null;
 
 function focusedSymbol(current = state) { return chartFocusSymbol || current?.config?.symbol || ''; }
@@ -365,6 +369,21 @@ function updateChart(market) {
   mainCandleChart.update({ symbol: market.symbol, source: state.config.data_source, market, position: positionsOf().find((position) => position.symbol === market.symbol), networkHealthy, statusFresh: state.status.fresh });
 }
 
+function updateBtcCorner() {
+  if (!state || !$('btcCornerChart')) return;
+  if (!btcCornerChart) {
+    btcCornerChart = new SpotMarketChart($('btcCornerChart'), { interval: '5m', height: 160, visibleCandles: 30 });
+    const interval = $('btcCornerChart').querySelector('.smc-interval');
+    interval.replaceChildren(new Option('5 dakika', '5m'));
+    interval.value = '5m';
+    interval.disabled = true;
+  }
+  const source = state.config?.data_source || 'binance';
+  const market = marketsOf().find((item) => item.symbol === 'BTCUSDT') || { symbol: 'BTCUSDT' };
+  text('btcCornerSource', source === 'demo' ? 'SENTETİK DEMO' : 'BINANCE SPOT');
+  btcCornerChart.update({ symbol: 'BTCUSDT', source, market, networkHealthy, statusFresh: state.status?.fresh });
+}
+
 function renderChartPosition(market, positions) {
   const position = positions.find((entry) => entry.symbol === market.symbol);
   $('chartPosition').hidden = !position;
@@ -478,6 +497,7 @@ function render(current, local = false) {
   renderTrades(trades);
   renderBacktest(current.backtest);
   updateChart(market);
+  updateBtcCorner();
   observeFills(current);
   updateButtons();
 }
@@ -646,7 +666,7 @@ async function fetchState() {
     text('refreshStatus', 'Bağlantı yok · otomatik yeniden deneniyor');
     $('refreshStatus').className = 'negative';
     updateButtons();
-    if (state) updateChart(focusedMarket(state));
+    if (state) { updateChart(focusedMarket(state)); updateBtcCorner(); }
   } finally { fetching = false; }
 }
 

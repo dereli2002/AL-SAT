@@ -85,6 +85,17 @@ def _nonnegative(value):
     return result
 
 
+def _quote_volume(value):
+    """A broken optional liquidity field must not suppress technical exits."""
+    try:
+        volume = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not volume.is_finite() or volume < 0:
+        return None
+    return str(volume)
+
+
 def _filter_values(pair):
     rules = {item['filterType']: item for item in pair.get('filters', [])
              if isinstance(item, dict) and isinstance(item.get('filterType'), str)}
@@ -252,6 +263,8 @@ class BinanceMarket:
                           close_time=iso(datetime.fromtimestamp(row[6]/1000, timezone.utc)),
                           open=str(row[1]), high=str(row[2]), low=str(row[3]),
                           close=str(row[4]), volume=str(row[5]))
+            if len(row) > 7:
+                candle['quote_volume'] = _quote_volume(row[7])
             if row[6] < now_ms:
                 closed.append(candle)
             elif row[0] <= now_ms:
@@ -260,7 +273,50 @@ class BinanceMarket:
 
     def candles(self, symbol, interval, limit=500):
         valid_market(symbol, interval)
-        return self.chart_candles(symbol, interval, limit)['candles']
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 100 <= limit <= 2500:
+            raise ValueError('Strateji mum sayısı 100–2500 arasında tam sayı olmalı.')
+        if limit <= 1000:
+            return self.chart_candles(symbol, interval, limit)['candles']
+        # Session VWAP needs the beginning of the UTC day even for a short
+        # evaluation window. Binance caps a request at 1000 rows, so page
+        # backwards with an exclusive boundary; never include a forming bar.
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        duration_ms = INTERVALS[interval] * 1000
+        end_time = now_ms // duration_ms * duration_ms - 1
+        output = []
+        while len(output) < limit:
+            page_limit = min(1000, limit - len(output))
+            raw = self._get('/api/v3/klines', {'symbol': symbol, 'interval': interval,
+                                             'limit': page_limit, 'endTime': end_time})
+            if not isinstance(raw, list):
+                raise ValueError('Borsa mum yanıtı geçersiz.')
+            if len(raw) > page_limit:
+                raise ValueError('Borsa mum sayfası istenen sınırı aşıyor.')
+            page, previous_end = [], None
+            for row in raw:
+                if not isinstance(row, list) or len(row) < 7:
+                    raise ValueError('Borsa mum satırı geçersiz.')
+                opened, closed = row[0], row[6]
+                if (isinstance(opened, bool) or isinstance(closed, bool)
+                        or not isinstance(opened, int) or not isinstance(closed, int)
+                        or opened >= closed or closed > end_time or closed >= now_ms
+                        or (previous_end is not None and opened <= previous_end)):
+                    raise ValueError('Borsa mum sayfaları sıralı ve kapanmış olmalı.')
+                candle = dict(open_time=iso(datetime.fromtimestamp(opened/1000, timezone.utc)),
+                                 close_time=iso(datetime.fromtimestamp(closed/1000, timezone.utc)),
+                                 open=str(row[1]), high=str(row[2]), low=str(row[3]),
+                                 close=str(row[4]), volume=str(row[5]))
+                if len(row) > 7:
+                    candle['quote_volume'] = _quote_volume(row[7])
+                page.append(candle)
+                previous_end = closed
+            if not page:
+                break
+            output = page + output
+            end_time = int(raw[0][0]) - 1
+            if len(raw) < page_limit:
+                break
+        return output
 
     def filters(self, symbol):
         valid_market(symbol, '1m')
@@ -330,8 +386,8 @@ class DemoMarket:
 
     def _display_candles(self, symbol, interval, limit=500):
         valid_chart(symbol, interval)
-        if not 100 <= limit <= 1000:
-            raise ValueError('Mum sayısı 100–1000 arasında olmalı.')
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 100 <= limit <= 2500:
+            raise ValueError('Strateji mum sayısı 100–2500 arasında tam sayı olmalı.')
         _selected_symbols([symbol], {pair['symbol'] for pair in self.symbols()})
         duration = CHART_INTERVALS[interval]
         output = []
@@ -341,9 +397,12 @@ class DemoMarket:
             i = 500 + step + offset - limit
             start = anchor + timedelta(seconds=(step+offset-limit)*duration)
             opened, closed = self._price(i, symbol), self._price(i+1, symbol)
-            output.append(dict(open_time=iso(start), close_time=iso(start+timedelta(seconds=duration)-timedelta(milliseconds=1)),
+            candle = dict(open_time=iso(start), close_time=iso(start+timedelta(seconds=duration)-timedelta(milliseconds=1)),
                                open=f'{opened:.8f}', high=f'{max(opened,closed)*1.002:.8f}',
-                               low=f'{min(opened,closed)*.998:.8f}', close=f'{closed:.8f}', volume='100'))
+                               low=f'{min(opened,closed)*.998:.8f}', close=f'{closed:.8f}', volume='100')
+            typical = sum((Decimal(candle[key]) for key in ('high', 'low', 'close')), Decimal(0)) / 3
+            candle['quote_volume'] = str(typical * Decimal(candle['volume']))
+            output.append(candle)
         return output
 
     def candles(self, symbol, interval, limit=500):
@@ -351,6 +410,8 @@ class DemoMarket:
         return self._display_candles(symbol, interval, limit)
 
     def chart_candles(self, symbol, interval, limit=100):
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 100 <= limit <= 1000:
+            raise ValueError('Mum sayısı 100–1000 arasında tam sayı olmalı.')
         return dict(candles=self._display_candles(symbol, interval, limit), live_candle=None)
 
     def sample(self, symbol, interval):

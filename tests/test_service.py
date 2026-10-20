@@ -12,8 +12,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from bot.service import BotService, Store, CHART_CACHE_SIZE, CHART_CACHE_TTL, TREND_POINTS
-from bot.market import DemoMarket
+from bot.market import DemoMarket, INTERVALS
 from bot.core import DEFAULT_CONFIG, PaperBroker
+from bot.strategies import STRATEGIES
+from bot.backtest import run_backtest, _validated
 from app import Handler
 
 
@@ -27,11 +29,19 @@ class Feed:
         self.fail=False
 
     def candles(self,symbol,interval,limit=100):
-        start=datetime(2026,1,1,tzinfo=timezone.utc)
-        return [dict(open_time=(start+timedelta(minutes=i)).isoformat(),
-                     close_time=(start+timedelta(minutes=i+1,milliseconds=-1)).isoformat(),
-                     open=str(200-i),high=str(201-i),low=str(198-i),close=str(199-i),volume='100')
-                for i in range(100)]
+        duration=timedelta(seconds=INTERVALS.get(interval,1))
+        start=datetime(2026,1,1,tzinfo=timezone.utc)-(limit-100)*duration
+        rows=[]
+        for index in range(limit):
+            # A quiet preceding day plus the original 100-candle decline.
+            # Exact large USDT volumes make these explicitly liquid fixtures.
+            offset=max(0,index-(limit-100))
+            opened=200-offset
+            rows.append(dict(open_time=(start+index*duration).isoformat(),
+                             close_time=(start+(index+1)*duration-timedelta(milliseconds=1)).isoformat(),
+                             open=str(opened),high=str(opened+1),low=str(opened-2),
+                             close=str(opened-1),volume='1000',quote_volume=str(opened*1000)))
+        return rows
 
     def symbols(self):
         return [dict(symbol=s,base_asset=s[:-4],quote_asset='USDT') for s in ('BTCUSDT','ETHUSDT','币安人生USDT')]
@@ -125,11 +135,139 @@ class ServiceTests(unittest.TestCase):
         self.service.feed=DemoMarket()
         report=self.service.test_history(dict(strategy='all',limit=200))
         self.assertTrue(report['is_synthetic'])
-        self.assertEqual(5,len(report['results']))
+        self.assertEqual(len(STRATEGIES),len(report['results']))
         self.assertIn('trend_breakout', [result['strategy'] for result in report['results']])
+        self.assertIn('rsi_band', [result['strategy'] for result in report['results']])
+        self.assertIn('vwap_ema', [result['strategy'] for result in report['results']])
         self.assertTrue(any(int(result['trade_count'])>0 for result in report['results']))
         self.assertEqual('estimate',report['fee_kind'])
         self.assertIsNotNone(self.service.state()['backtest'])
+
+    def test_vwap_prefix_keeps_comparison_window_costs_and_portfolio_unchanged(self):
+        self.service.configure(dict(interval='1m'))
+        self.service.feed=DemoMarket()
+        before=self.service.portfolio.export_state()
+        with patch.object(self.service.feed,'candles',wraps=self.service.feed.candles) as request:
+            ema=self.service.test_history(dict(strategy='ema_cross',limit=200))['results'][0]
+            report=self.service.test_history(dict(strategy='all',limit=200))
+        self.assertEqual([1640,1640],[call.args[2] for call in request.call_args_list])
+        self.assertEqual((140,60),(report['train_candles'],report['test_candles']))
+        self.assertEqual(ema,next(row for row in report['results'] if row['strategy']=='ema_cross'))
+        for row in report['results']:
+            self.assertEqual((140,60),(row['train_candles'],row['test_candles']))
+            self.assertEqual(report['test_start'],row['test_start'])
+            self.assertEqual(report['test_end'],row['test_end'])
+            self.assertEqual(report['fee_assumption'],row['fee_assumption'])
+            self.assertEqual(1440,row['context_candles'])
+        self.assertEqual(before,self.service.portfolio.export_state())
+        self.assertFalse(self.service.running)
+
+    def test_live_session_and_volume_scans_request_full_day_context(self):
+        feed=DemoMarket()
+        with patch.object(feed,'candles',wraps=feed.candles) as request:
+            self.assertEqual(1540,len(self.service._scan(feed,'BTCUSDT','1m','vwap_ema')['bars']))
+            self.assertEqual(388,len(self.service._scan(feed,'BTCUSDT','5m','vwap_ema')['bars']))
+            self.assertEqual(1540,len(self.service._scan(feed,'BTCUSDT','1m','scalping')['bars']))
+            self.assertEqual(1540,len(self.service._scan(feed,'BTCUSDT','1m','rsi_band')['bars']))
+        self.assertEqual([1540,388,1540,1540],[call.args[2] for call in request.call_args_list])
+
+    def test_single_scalping_backtest_retrieves_volume_context(self):
+        self.service.configure(dict(interval='1m'))
+        self.service.feed=DemoMarket()
+        with patch.object(self.service.feed,'candles',wraps=self.service.feed.candles) as request:
+            report=self.service.test_history(dict(strategy='scalping',limit=200))
+        request.assert_called_once_with('BTCUSDT','1m',1640)
+        result=report['results'][0]
+        self.assertEqual(1440,result['context_candles'])
+        self.assertEqual((140,60),(result['train_candles'],result['test_candles']))
+        self.assertTrue(any('24 saat' in note for note in result['notes']))
+
+    def test_backtest_preserves_optional_quote_volume_without_approximation(self):
+        rows=DemoMarket().candles('BTCUSDT','1m',100)
+        rows[0]['quote_volume']='123456.7890123456789'
+        del rows[1]['quote_volume']
+        normalized=_validated(rows)
+        self.assertEqual('123456.7890123456789',normalized[0]['quote_volume'])
+        self.assertNotIn('quote_volume',normalized[1])
+        for value in ('NaN','Infinity','-1','not-a-number',None):
+            rows[0]['quote_volume']=value
+            with self.subTest(value=value):
+                self.assertIsNone(_validated(rows)[0]['quote_volume'])
+
+    def test_low_volume_blocks_automatic_entry_despite_valid_rsi_buy(self):
+        original=self.feed.candles
+        def thin_market(symbol,interval,limit=100):
+            bars=original(symbol,interval,limit)
+            for row in bars:
+                row['quote_volume']='1'
+            return bars
+        self.feed.candles=thin_market
+        self.settle()
+        details=self.service._cache['BTCUSDT']['details']
+        self.assertEqual('buy',details['technical_signal'])
+        self.assertEqual('hold',details['signal'])
+        self.assertFalse(details['liquidity']['eligible'])
+        self.service.control('start')
+        self.service.step()
+        self.assertEqual([],self.service.state()['positions'])
+        self.assertEqual('0',self.service.state()['account']['fees_paid'])
+
+    def test_low_volume_never_blocks_an_existing_positions_protective_exit(self):
+        self.enter()
+        original=self.feed.candles
+        def thin_market(symbol,interval,limit=100):
+            bars=original(symbol,interval,limit)
+            for row in bars:
+                row['quote_volume']='0'
+            return bars
+        self.feed.candles=thin_market
+        self.feed.price='90'
+        self.service.step()
+        state=self.service.state()
+        self.assertEqual([],state['positions'])
+        self.assertEqual('fixed_stop',state['trades'][0]['reason'])
+
+    def test_invalid_quote_volume_preserves_a_technical_strategy_exit(self):
+        self.enter()
+        original=self.feed.candles
+        def rally_with_bad_quote_volume(symbol,interval,limit=100):
+            bars=original(symbol,interval,limit)
+            duration=timedelta(seconds=INTERVALS[interval])
+            for index,row in enumerate(bars):
+                opened=100+max(0,index-(limit-100))
+                row.update(open=str(opened),high=str(opened+2),low=str(opened-1),
+                           close=str(opened+1),quote_volume='NaN',
+                           open_time=(datetime.fromisoformat(row['open_time'])+duration).isoformat(),
+                           close_time=(datetime.fromisoformat(row['close_time'])+duration).isoformat())
+            return bars
+        self.feed.candles=rally_with_bad_quote_volume
+        self.service._next_due.clear()
+        self.settle()
+        details=self.service._cache['BTCUSDT']['details']
+        self.assertEqual('sell',details['technical_signal'])
+        self.assertEqual('sell',details['signal'])
+        self.assertFalse(details['liquidity']['eligible'])
+        state=self.service.state()
+        self.assertEqual([],state['positions'])
+        self.assertEqual('signal',state['trades'][0]['reason'])
+
+    def test_history_limit_is_validated_before_extended_requests(self):
+        for limit in (True,99,1001,None,100.5,[],'100.5'):
+            with self.subTest(limit=limit),patch.object(self.feed,'candles') as request:
+                with self.assertRaises(ValueError):
+                    self.service.test_history(dict(strategy='all',limit=limit))
+                request.assert_not_called()
+
+    def test_backtest_rejects_future_overlapping_or_invalid_session_prefix(self):
+        feed=DemoMarket()
+        history=feed.candles('BTCUSDT','1m',300)
+        context,bars=history[:100],history[100:]
+        settings=self.service.config
+        with self.assertRaisesRegex(ValueError,'çakışmamalı'):
+            run_backtest(bars,settings,'vwap_ema',context_candles=bars[:1])
+        context[-1]=dict(context[-1],volume='NaN')
+        with self.assertRaisesRegex(ValueError,'sonlu'):
+            run_backtest(bars,settings,'vwap_ema',context_candles=context)
 
 
     def test_multiple_symbols_share_one_balance_and_close_independently(self):
