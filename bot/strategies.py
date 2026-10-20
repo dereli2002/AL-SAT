@@ -6,6 +6,7 @@ execute it at the next candle's open, never at the close that created the signal
 """
 
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -513,27 +514,46 @@ def signal_details(candles, name="hybrid"):
             "votes": {name: vote}, "buy_votes": int(vote > 0), "sell_votes": int(vote < 0)}
 
 
-def signal_for(name, candles):
+def signal_for(name, candles, context_candles=(), volume_filter_enabled=True):
     """Convenience adapter used by a live paper-trading loop."""
-    result = entry_signals(candles, name)
+    result = entry_signals(candles, name, context_candles, volume_filter_enabled)
     return result[-1] if result else "hold"
 
 
-def entry_signals(candles, name, context_candles=()):
+def entry_signals(candles, name, context_candles=(), volume_filter_enabled=True):
     """Apply the common liquidity gate to automatic buys, never to exits.
 
     The earlier context supplies the full 24h volume window and session VWAP.
     Other technical indicators keep their original requested warmup window.
     """
+    if type(volume_filter_enabled) is not bool:
+        raise ValueError("Hacim filtresi açık/kapalı değeri boolean olmalı.")
     context = list(context_candles)
     history = context + list(candles)
     sequence = signals(history, name)[len(context):] if name == "vwap_ema" else signals(candles, name)
+    if not volume_filter_enabled:
+        return sequence
     volume = _rolling_quote_volume(history)[len(context):]
     return ["hold" if signal == "buy" and (amount is None or amount < MIN_QUOTE_VOLUME_24H) else signal
             for signal, amount in zip(sequence, volume)]
 
 
-def entry_signal_details(candles, name, context_candles=()):
+def apply_volume_filter(detail, volume_filter_enabled=True):
+    """Reapply only the entry gate, including to cached technical decisions."""
+    if type(volume_filter_enabled) is not bool:
+        raise ValueError("Hacim filtresi açık/kapalı değeri boolean olmalı.")
+    result = deepcopy(detail)
+    technical = result.get("technical_signal", result["signal"])
+    liquidity = result.setdefault("liquidity", {})
+    liquidity["enabled"] = volume_filter_enabled
+    eligible = bool(liquidity.get("eligible", False))
+    result["technical_signal"] = technical
+    result["entry_ready"] = bool(result["ready"] and (not volume_filter_enabled or eligible))
+    result["signal"] = "hold" if volume_filter_enabled and technical == "buy" and not eligible else technical
+    return result
+
+
+def entry_signal_details(candles, name, context_candles=(), volume_filter_enabled=True):
     """Explain the technical signal and the shared automatic-entry filter."""
     context = list(context_candles)
     history = context + list(candles)
@@ -542,11 +562,9 @@ def entry_signal_details(candles, name, context_candles=()):
     amount = amounts[-1] if amounts and candles else None
     eligible = amount is not None and amount >= MIN_QUOTE_VOLUME_24H
     technical = detail["signal"]
-    detail.update(technical_signal=technical, entry_ready=bool(detail["ready"] and eligible),
+    detail.update(technical_signal=technical,
                   liquidity={"quote_volume_24h": str(amount) if amount is not None else None,
                              "minimum_quote_volume_24h": str(MIN_QUOTE_VOLUME_24H),
                              "eligible": eligible, "basis": "closed_24h_quote_volume",
                              "evaluated_at": candles[-1]["close_time"] if candles else None})
-    if technical == "buy" and not eligible:
-        detail["signal"] = "hold"
-    return detail
+    return apply_volume_filter(detail, volume_filter_enabled)

@@ -51,6 +51,55 @@ let manualPicker = null;
 let mainCandleChart = null;
 let btcCornerChart = null;
 let displayInterval = null;
+let volumeFilterSaving = false;
+let volumeFilterPending = null;
+let volumeFilterVersion = 0;
+let volumeFilterKnown = null;
+let volumeFilterUncertain = false;
+
+function renderVolumeFilter() {
+  const toggle = $('volumeFilterToggle');
+  const fresh = Boolean(networkHealthy && lastStateSuccessAt && Date.now() - lastStateSuccessAt < 30000);
+  const known = typeof volumeFilterKnown === 'boolean';
+  if (volumeFilterSaving && typeof volumeFilterPending === 'boolean') toggle.checked = volumeFilterPending;
+  else if (known) toggle.checked = volumeFilterKnown;
+  toggle.disabled = requestBusy || emergencyBusy || volumeFilterSaving || !fresh || !known || volumeFilterUncertain;
+  toggle.setAttribute('aria-busy', String(volumeFilterSaving));
+  const label = volumeFilterSaving ? 'Kaydediliyor…' : volumeFilterUncertain || !known ? 'Durum doğrulanıyor' : !fresh ? `Son durum: ${volumeFilterKnown ? 'Açık' : 'Kapalı'}` : volumeFilterKnown ? 'Açık' : 'Kapalı';
+  text('volumeFilterState', label);
+  $('volumeFilterControl').classList.toggle('is-off', known && !volumeFilterKnown);
+  text('automaticVolumeNote', volumeFilterSaving ? 'Hacim filtresi değişikliği kaydediliyor…' : volumeFilterUncertain || !known ? 'Filtrenin durumu sunucudan doğrulanıyor. Yeni bir değişiklik yapmadan önce güncel durum bekleniyor.' : !fresh ? 'Bağlantı bekleniyor; gösterilen filtre durumu son başarılı okumaya aittir.' : volumeFilterKnown ? 'Açık: Tüm stratejilerde otomatik AL için son 24 saatlik hacim en az 10 milyon USDT olmalı. Eksik hacim geçmişinde alış yapılmaz.' : 'Kapalı: 10 milyon USDT hacim sınırı uygulanmaz. Otomatik AL için seçili stratejinin sinyali ve diğer işlem/risk koşulları gerekir.');
+}
+
+async function changeVolumeFilter() {
+  const toggle = $('volumeFilterToggle');
+  if (requestBusy || emergencyBusy || volumeFilterSaving || typeof volumeFilterKnown !== 'boolean') { renderVolumeFilter(); return; }
+  const enabled = toggle.checked;
+  const version = emergencyVersion;
+  volumeFilterSaving = true;
+  volumeFilterPending = enabled;
+  volumeFilterVersion += 1;
+  requestBusy = true;
+  updateButtons();
+  try {
+    const result = await api('/api/config', { method: 'PATCH', body: JSON.stringify({ volume_filter_enabled: enabled }) });
+    if (typeof result.config?.volume_filter_enabled !== 'boolean') throw new Error('Sunucu hacim filtresi durumunu doğrulamadı.');
+    volumeFilterKnown = result.config.volume_filter_enabled;
+    volumeFilterUncertain = false;
+    if (version === emergencyVersion) render(result);
+    toast(`Hacim filtresi ${volumeFilterKnown ? 'açıldı' : 'kapatıldı'}.`);
+  } catch (error) {
+    volumeFilterUncertain = true;
+    toast(`Hacim filtresi değişikliği doğrulanamadı: ${error.message} Durum yeniden sorgulanıyor.`, true);
+  } finally {
+    volumeFilterSaving = false;
+    volumeFilterPending = null;
+    volumeFilterVersion += 1;
+    requestBusy = false;
+    updateButtons();
+    await fetchState();
+  }
+}
 
 function focusedSymbol(current = state) { return chartFocusSymbol || current?.config?.symbol || ''; }
 
@@ -422,6 +471,9 @@ function updateCostEstimate() {
 }
 
 function render(current, local = false) {
+  // Non-state responses can finish after a newer filter change. Only a fresh
+  // state read or the explicit filter response may update its confirmed value.
+  if (typeof volumeFilterKnown === 'boolean' && current.config) current.config.volume_filter_enabled = volumeFilterKnown;
   state = current;
   if (!local) { networkHealthy = true; lastStateSuccessAt = Date.now(); }
   if (chartFocusSource && chartFocusSource !== current.config?.data_source) chartFocusSymbol = '';
@@ -522,6 +574,7 @@ function updateButtons() {
   $('emergencyButton').disabled = emergencyBusy;
   $('clearEmergencyButton').disabled = requestBusy || emergencyBusy || !emergency.active || pending.length > 0 || positions.length > 0;
   configForm.elements.namedItem('initial_cash').disabled = positions.length > 0 || (Array.isArray(current.trades) && current.trades.length > 0);
+  renderVolumeFilter();
   updateManualControls();
 }
 
@@ -633,6 +686,8 @@ function renderBacktest(report) {
   $('backtestResults').hidden = !available;
   $('backtestEmpty').hidden = available || backtestBusy;
   if (!available) return;
+  const filterMode = typeof report.volume_filter_enabled === 'boolean' ? report.volume_filter_enabled : results[0]?.volume_filter_enabled;
+  text('backtestFilterMode', typeof filterMode === 'boolean' ? `Bu testte hacim filtresi: ${filterMode ? 'AÇIK · 10 milyon USDT' : 'KAPALI'}` : 'Bu eski raporda hacim filtresi tercihi kaydedilmemiş.');
   const tbody = $('backtestBody'); tbody.replaceChildren();
   results.forEach((result) => {
     const row = document.createElement('tr');
@@ -655,7 +710,17 @@ async function fetchState() {
   if (fetching) return;
   fetching = true;
   const version = emergencyVersion;
-  try { const current = await api('/api/state'); if (version === emergencyVersion) render(current); }
+  const filterVersion = volumeFilterVersion;
+  try {
+    const current = await api('/api/state');
+    if (version === emergencyVersion) {
+      if (filterVersion === volumeFilterVersion && !volumeFilterSaving) {
+        volumeFilterKnown = typeof current.config?.volume_filter_enabled === 'boolean' ? current.config.volume_filter_enabled : null;
+        volumeFilterUncertain = volumeFilterKnown === null;
+      }
+      render(current);
+    }
+  }
   catch (error) {
     networkHealthy = false;
     renderLivePnl();
@@ -757,6 +822,7 @@ configForm.addEventListener('submit', async (event) => {
 });
 $('startButton').addEventListener('click', () => control('start'));
 $('pauseButton').addEventListener('click', () => control('pause'));
+$('volumeFilterToggle').addEventListener('change', changeVolumeFilter);
 $('manualTradeForm').addEventListener('submit', (event) => { event.preventDefault(); manualTrade('buy'); });
 $('manualSellButton').addEventListener('click', () => manualTrade('sell'));
 $('manualSymbol').addEventListener('input', () => { manualSymbolTouched = true; $('manualSymbol').setCustomValidity(''); updateManualControls(); });
@@ -811,4 +877,4 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 updateButtons();
 fetchState();
 setInterval(fetchState, 3000);
-setInterval(() => { if (state) renderLivePnl(); }, 1000);
+setInterval(() => { if (state) { renderLivePnl(); renderVolumeFilter(); } }, 1000);

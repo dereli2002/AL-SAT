@@ -129,10 +129,13 @@ def _context(candles, context_candles):
     return context
 
 
-def _strategy_notes(strategies, context_count=0):
+def _strategy_notes(strategies, context_count=0, volume_filter_enabled=True):
     notes = [STRATEGIES[name]['name'] + ': ' + STRATEGIES[name]['description']
              for name in strategies if name in ('hybrid', 'rsi_band', 'vwap_ema', 'scalping')]
-    notes.append('Tüm stratejilerde önceki ' + str(context_count) + ' mum son 24 saatin kapanmış mum USDT hacmi hesabına ön geçmiş sağlar; test penceresi ile %70/%30 ayrımı değişmez. Tam 24 saatlik kesintisiz veri ve borsadan gelen USDT hacmi yoksa veya toplam 10 milyon USDT altındaysa yeni alış bekler. Satış ve koruyucu stoplar bu filtreden bağımsızdır. USDT, dolar hacmi için yaklaşık karşılıktır.')
+    if volume_filter_enabled:
+        notes.append('Hacim filtresi: AÇIK. Tüm stratejilerde önceki ' + str(context_count) + ' mum son 24 saatin kapanmış mum USDT hacmi hesabına ön geçmiş sağlar; test penceresi ile %70/%30 ayrımı değişmez. Tam 24 saatlik kesintisiz veri ve borsadan gelen USDT hacmi yoksa veya toplam 10 milyon USDT altındaysa yeni alış bekler. Satış ve koruyucu stoplar bu filtreden bağımsızdır. USDT, dolar hacmi için yaklaşık karşılıktır.')
+    else:
+        notes.append('Hacim filtresi: KAPALI. Otomatik alışlar için 10 milyon USDT veya tam 24 saatlik hacim geçmişi şartı uygulanmadı. Strateji koşulları ve koruyucu risk kuralları geçerlidir; WAP EMA için günlük VWAP geçmişi yine gereklidir.')
     if 'vwap_ema' in strategies:
         notes.append('WAP EMA ön geçmişi günlük UTC VWAP göstergesini de ısıtır; gün başlangıcı eksikse ya da seans verisi kopuksa WAP sinyali bekler.')
     return notes
@@ -145,7 +148,9 @@ def _run(candles, config, strategy, context_candles=()):
     # Session/volume prefixes only supply indicator history. They never expand
     # the requested window, changes the 70/30 split, or places earlier trades.
     context = list(context_candles)
-    sequence = entry_signals(candles, strategy, context_candles=context)
+    volume_filter_enabled=config.get('volume_filter_enabled',True)
+    sequence = entry_signals(candles, strategy, context_candles=context,
+                             volume_filter_enabled=volume_filter_enabled)
     broker = PaperBroker(config)
     initial_cash = _decimal(broker.snapshot(candles[split]["open"])["equity"])
     if initial_cash <= 0:
@@ -199,12 +204,13 @@ def _run(candles, config, strategy, context_candles=()):
         "final_equity": str(final["equity"]),
         "fee_assumption": _fee_assumption(config),
         "context_candles": len(context),
+        "volume_filter_enabled": volume_filter_enabled,
         "intrabar_paths": paths,
         "trades": final.get("trades", []),
         "events": events,
         "equity_curve": curve,
         **_metadata(candles, split),
-        "notes": list(NOTES) + _strategy_notes([strategy], len(context)),
+        "notes": list(NOTES) + _strategy_notes([strategy], len(context), volume_filter_enabled),
     }
 
 
@@ -222,5 +228,6 @@ def compare_strategies(candles, config, context_candles=()):
         "results": [_run(candles, config, strategy, context) for strategy in STRATEGIES],
         **_metadata(candles, _split(candles)),
         "fee_assumption": _fee_assumption(config),
-        "notes": list(NOTES) + _strategy_notes(STRATEGIES, len(context)),
+        "volume_filter_enabled": config.get('volume_filter_enabled',True),
+        "notes": list(NOTES) + _strategy_notes(STRATEGIES, len(context), config.get('volume_filter_enabled',True)),
     }

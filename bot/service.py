@@ -13,12 +13,12 @@ import time
 from .core import DEFAULT_CONFIG, normalize_config
 from .portfolio import PaperPortfolio
 from .market import BinanceMarket, DemoMarket, INTERVALS, CHART_INTERVALS, valid_market, valid_chart
-from .strategies import STRATEGIES, entry_signal_details
+from .strategies import STRATEGIES, entry_signal_details, apply_volume_filter
 from .backtest import compare_strategies, run_backtest
 
 APP_DEFAULTS = dict(symbol='BTCUSDT', symbols=['BTCUSDT','ETHUSDT','SOLUSDT'],
                     universe_mode='all', max_open_positions=5, interval='5m',
-                    strategy='hybrid', data_source='binance')
+                    strategy='hybrid', data_source='binance', volume_filter_enabled=True)
 SCAN_BATCH_SIZE = 12
 CHART_CACHE_SIZE = 64
 CHART_CACHE_TTL = 30
@@ -29,6 +29,9 @@ TREND_SYMBOL_LIMIT = 2000
 
 def validated_config(config):
     result = normalize_config(config)
+    result.setdefault('volume_filter_enabled',True)
+    if type(result['volume_filter_enabled']) is not bool:
+        raise ValueError('Hacim filtresi açık/kapalı değeri boolean olmalı.')
     valid_market(result['symbol'], result['interval'])
     if result['strategy'] not in STRATEGIES or result['data_source'] not in ('binance','demo'):
         raise ValueError('Geçersiz strateji veya veri kaynağı.')
@@ -312,8 +315,8 @@ class BotService:
                         updated_at=self._quote_time,trends=output)
 
     @staticmethod
-    def _scan(feed,symbol,interval,strategy=None):
-        limit=100 + 86400//INTERVALS[interval]
+    def _scan(feed,symbol,interval,strategy=None,volume_filter_enabled=True):
+        limit=100 + (86400//INTERVALS[interval] if volume_filter_enabled or strategy=='vwap_ema' else 0)
         bars=feed.candles(symbol,interval,limit)
         if len(bars)<60:
             raise ValueError('Sinyal için en az 60 kapanmış mum gerekli.')
@@ -334,7 +337,8 @@ class BotService:
                 sample=future.result()
                 bars=sample['bars']
                 self._remember_chart(symbol,config['interval'],bars[-100:])
-                details=entry_signal_details(bars[-100:],config['strategy'],context_candles=bars[:-100])
+                details=entry_signal_details(bars[-100:],config['strategy'],context_candles=bars[:-100],
+                                             volume_filter_enabled=self.config['volume_filter_enabled'])
                 self._cache[symbol]=dict(candle=bars[-1]['close_time'],signal=details['signal'],
                                          details=details,filters=sample['filters'])
                 self._last_symbol=symbol
@@ -363,7 +367,7 @@ class BotService:
                 break
             if symbol in self._pending or self._next_due.get(symbol,0)>now:
                 continue
-            self._pending[symbol]=(self._generation,self._executor.submit(self._scan,feed,symbol,config['interval'],config['strategy']))
+            self._pending[symbol]=(self._generation,self._executor.submit(self._scan,feed,symbol,config['interval'],config['strategy'],config['volume_filter_enabled']))
             if symbol in self._universe:
                 self._cursor=(self._universe.index(symbol)+1)%len(self._universe)
 
@@ -434,6 +438,10 @@ class BotService:
                         if closed+0.002<self._manual_overrides.get(symbol,0):
                             continue
                         # A cache belongs to the current interval/strategy generation.
+                        # A hot toggle can arrive while quote/candle I/O is in
+                        # flight. The current setting governs execution.
+                        details=apply_volume_filter(sample['details'],self.config['volume_filter_enabled'])
+                        sample.update(signal=details['signal'],details=details)
                         new_signals[symbol]=sample['signal']
                         self._manual_overrides.pop(symbol,None)
                         filters[symbol]=sample['filters']
@@ -489,6 +497,20 @@ class BotService:
         with self.lock:
             merged=validated_config({**self.config,**patch})
             available={item['symbol'] for item in self._catalog}
+            if set(patch)=={'volume_filter_enabled'}:
+                # This changes future entries, not holdings or protective risk.
+                # Preserve deduplication so a consumed candle cannot replay.
+                changed=merged['volume_filter_enabled']!=self.config['volume_filter_enabled']
+                self.config=merged
+                if changed:
+                    for sample in self._cache.values():
+                        details=apply_volume_filter(sample['details'],merged['volume_filter_enabled'])
+                        sample.update(signal=details['signal'],details=details)
+                    # A short scan started with the filter off may lack a day
+                    # of volume. Refresh it on the next scheduling pass.
+                    self._next_due.clear()
+                self._save()
+                return self.state()
             if set(patch)=={'symbol'}:
                 if available and merged['symbol'] not in available|set(self.portfolio.position_symbols):
                     raise ValueError('Seçilen sembol aktif USDT Spot listesinde veya açık pozisyonlarda yok.')
@@ -665,7 +687,8 @@ class BotService:
         if strategy not in tuple(STRATEGIES)+('all',):
             raise ValueError('Geçersiz strateji.')
         try:
-            history_limit=limit + 86400//INTERVALS[interval]
+            needs_context=config['volume_filter_enabled'] or strategy in ('all','vwap_ema')
+            history_limit=limit + (86400//INTERVALS[interval] if needs_context else 0)
             history=feed.candles(symbol,interval,history_limit)
             bars=history[-limit:]
             context=history[:-limit]
@@ -679,9 +702,10 @@ class BotService:
             result=run_backtest(bars,config,strategy,context_candles=context)
             report=dict(results=[result],train_candles=int(len(bars)*.7),test_candles=len(bars)-int(len(bars)*.7),notes=result.get('notes',[]))
         report.update(data_source=config['data_source'],is_synthetic=feed.is_synthetic,symbol=symbol,interval=interval,
-                      fee_kind='estimate',generated_at=datetime.now(timezone.utc).isoformat())
+                      fee_kind='estimate',volume_filter_enabled=config['volume_filter_enabled'],
+                      generated_at=datetime.now(timezone.utc).isoformat())
         with self.lock:
-            if generation!=self._generation:
+            if generation!=self._generation or config['volume_filter_enabled']!=self.config['volume_filter_enabled']:
                 raise ValueError('Test sırasında ayarlar değişti; testi yeniden çalıştırın.')
             self.backtest=report
             self._save()
